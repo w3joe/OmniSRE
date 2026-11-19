@@ -12,6 +12,7 @@ build/
 
 # Datasets, Checkpoints & Logs
 data/generated/
+data/real_sre_v2/
 outputs/
 checkpoints/
 wandb/
