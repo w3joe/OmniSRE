@@ -35,6 +35,18 @@ def main() -> None:
         default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-sft-merged"),
     )
     parser.add_argument(
+        "--train-jsonl",
+        type=Path,
+        default=None,
+        help="Optional override for SFT training JSONL path.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional override for SFT LoRA adapter output dir.",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=-1,
@@ -90,7 +102,8 @@ def main() -> None:
     model.print_trainable_parameters()
 
     # 3. Load cold-start SRE trajectories & apply bounded `preserve_thinking`
-    raw_ds = load_dataset("json", data_files=cfg["data"]["train_jsonl"], split="train")
+    train_jsonl_path = str(args.train_jsonl) if args.train_jsonl is not None else cfg["data"]["train_jsonl"]
+    raw_ds = load_dataset("json", data_files=train_jsonl_path, split="train")
     preserve = bool(cfg["data"].get("preserve_thinking", True))
 
     def _format_row(example):
@@ -103,8 +116,9 @@ def main() -> None:
     train_ds = raw_ds.map(_format_row, remove_columns=raw_ds.column_names)
 
     t_cfg = cfg["training"]
+    out_dir = str(args.output_dir) if args.output_dir is not None else t_cfg["output_dir"]
     sft_args = SFTConfig(
-        output_dir=t_cfg["output_dir"],
+        output_dir=out_dir,
         dataset_text_field="text",
         max_length=int(cfg["data"]["max_seq_length"]),
         num_train_epochs=float(t_cfg["num_train_epochs"]),
@@ -132,7 +146,7 @@ def main() -> None:
         args=sft_args,
     )
     trainer.train()
-    trainer.save_model(t_cfg["output_dir"])
+    trainer.save_model(out_dir)
 
     # 4. Merge LoRA into BF16 base checkpoint on rank 0 for Stage 2 veRL initialization
     if not args.skip_merge and trainer.accelerator.is_main_process:

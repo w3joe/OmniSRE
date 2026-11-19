@@ -188,6 +188,18 @@ def main() -> None:
         type=Path,
         default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-rl-dapo-gtpo"),
     )
+    parser.add_argument(
+        "--train-scenarios-jsonl",
+        type=Path,
+        default=None,
+        help="Optional veRL JSONL file (e.g. rl_real_train.jsonl) with serialized IncidentScenario ground_truth.",
+    )
+    parser.add_argument(
+        "--heldout-scenarios-jsonl",
+        type=Path,
+        default=None,
+        help="Optional veRL JSONL file (e.g. rl_real_heldout.jsonl) for before/after held-out eval.",
+    )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--max-scenario-attempts", type=int, default=60)
     parser.add_argument("--eval-heldout-count", type=int, default=12)
@@ -243,11 +255,41 @@ def main() -> None:
         weight_decay=0.01,
     )
 
-    splits = split_scenarios_decontaminated(
-        generate_scenario_suite(num_scenarios=400, seed=args.seed)
-    )
-    scenarios = splits.train
-    heldout_eval_scenarios = splits.eval_heldout[: args.eval_heldout_count]
+    def _load_verl_jsonl_scenarios(path: Path) -> list[IncidentScenario]:
+        loaded: list[IncidentScenario] = []
+        for ln in path.read_text(encoding="utf-8").splitlines():
+            if not ln.strip():
+                continue
+            row = json.loads(ln)
+            gt = row["reward_model"]["ground_truth"]
+            sc = (
+                IncidentScenario.model_validate_json(gt)
+                if isinstance(gt, str)
+                else IncidentScenario.model_validate(gt)
+            )
+            loaded.append(sc)
+        return loaded
+
+    if args.train_scenarios_jsonl is not None and args.train_scenarios_jsonl.exists():
+        scenarios = _load_verl_jsonl_scenarios(args.train_scenarios_jsonl)
+        if args.heldout_scenarios_jsonl is not None and args.heldout_scenarios_jsonl.exists():
+            heldout_eval_scenarios = _load_verl_jsonl_scenarios(args.heldout_scenarios_jsonl)[
+                : args.eval_heldout_count
+            ]
+        else:
+            heldout_eval_scenarios = scenarios[-args.eval_heldout_count :]
+        if local_rank == 0:
+            print(
+                f"[rlvr] Loaded {len(scenarios)} train & {len(heldout_eval_scenarios)} held-out "
+                f"real grounded RLVR scenarios from {args.train_scenarios_jsonl}",
+                flush=True,
+            )
+    else:
+        splits = split_scenarios_decontaminated(
+            generate_scenario_suite(num_scenarios=400, seed=args.seed)
+        )
+        scenarios = splits.train
+        heldout_eval_scenarios = splits.eval_heldout[: args.eval_heldout_count]
 
     def _run_distributed_heldout_eval(label: str) -> dict[str, float]:
         local_eval_stats = []
