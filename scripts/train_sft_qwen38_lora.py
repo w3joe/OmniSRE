@@ -34,6 +34,17 @@ def main() -> None:
         type=Path,
         default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-sft-merged"),
     )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=-1,
+        help="Optional max optimizer steps override for smoke-testing.",
+    )
+    parser.add_argument(
+        "--skip-merge",
+        action="store_true",
+        help="Skip merging LoRA into a 54GB BF16 checkpoint at end of run.",
+    )
     args = parser.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -41,7 +52,7 @@ def main() -> None:
     import torch
     from datasets import load_dataset
     from peft import LoraConfig, get_peft_model
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModelForImageTextToText, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
     model_id = cfg["model"]["model_name_or_path"]
@@ -49,11 +60,11 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         model_id,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
-        attn_implementation=cfg["model"].get("attn_implementation", "flash_attention_2"),
+        dtype=torch.bfloat16,
+        attn_implementation=cfg["model"].get("attn_implementation", "sdpa"),
     )
 
     # 1. Freeze Vision Tower & Multi-Token Prediction (MTP) heads
@@ -95,8 +106,9 @@ def main() -> None:
     sft_args = SFTConfig(
         output_dir=t_cfg["output_dir"],
         dataset_text_field="text",
-        max_seq_length=int(cfg["data"]["max_seq_length"]),
+        max_length=int(cfg["data"]["max_seq_length"]),
         num_train_epochs=float(t_cfg["num_train_epochs"]),
+        max_steps=int(args.max_steps),
         per_device_train_batch_size=int(t_cfg["per_device_train_batch_size"]),
         gradient_accumulation_steps=int(t_cfg["gradient_accumulation_steps"]),
         learning_rate=float(t_cfg["learning_rate"]),
@@ -106,9 +118,11 @@ def main() -> None:
         max_grad_norm=float(t_cfg["max_grad_norm"]),
         bf16=True,
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=int(t_cfg["logging_steps"]),
         save_steps=int(t_cfg["save_steps"]),
         seed=int(t_cfg["seed"]),
+        report_to="none",
     )
 
     trainer = SFTTrainer(
@@ -121,7 +135,7 @@ def main() -> None:
     trainer.save_model(t_cfg["output_dir"])
 
     # 4. Merge LoRA into BF16 base checkpoint on rank 0 for Stage 2 veRL initialization
-    if trainer.accelerator.is_main_process:
+    if not args.skip_merge and trainer.accelerator.is_main_process:
         print(f"[sft] Merging LoRA adapter into {args.merge_output_dir} for Stage 2 RLVR...")
         merged = model.merge_and_unload()
         args.merge_output_dir.mkdir(parents=True, exist_ok=True)

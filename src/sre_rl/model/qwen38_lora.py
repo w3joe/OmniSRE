@@ -26,8 +26,12 @@ GATED_ATTN_MLP_PATTERNS: tuple[str, ...] = (
     "down_proj",
 )
 
-# Gated DeltaNet linear-attention blocks (48 layers in Qwen3.5 / Qwen3.8 `qwen3_5` arch)
+# Gated DeltaNet linear-attention blocks (48 layers in Qwen3.8-27B `Qwen3_5ForConditionalGeneration`)
 DELTANET_PROJECTION_PATTERNS: tuple[str, ...] = (
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_a",
+    "in_proj_b",
     "in_proj_qkvz",
     "in_proj_ba",
     "in_proj",
