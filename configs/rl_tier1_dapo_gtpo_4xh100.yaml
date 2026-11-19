@@ -1,0 +1,105 @@
+# Stage 2: Tier-1 Snapshot Multi-Turn RLVR (DAPO + GTPO) on GCP a3-highgpu-4g (4x H100 80GB)
+# Colocated FSDP2 LoRA Trainer + SGLang FP8 Rollout Engine across 4x H100 HBM3 (320 GB VRAM)
+
+data:
+  train_files: /mnt/nvme/data/rl_tier1_train.parquet
+  val_files: /mnt/nvme/data/rl_tier1_val.parquet
+  train_batch_size: 32
+  max_prompt_length: 4096
+  max_response_length: 28672        # 32K total multi-turn window (with bounded 4K tool outputs)
+  filter_overlong_prompts: true
+  return_raw_chat: true
+
+actor_rollout_ref:
+  hybrid_engine: true
+  model:
+    path: /mnt/nvme/checkpoints/qwen38-27b-sre-sft-merged
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    lora:
+      type: vlm_lora
+      merge: true                   # Required by SGLang for zero-overhead rollout weight sync
+      rank: 64
+      alpha: 64
+      dropout: 0.0
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: true
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+        - in_proj_qkvz
+        - in_proj_ba
+        - in_proj
+        - out_proj
+        - ba_proj
+
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 16
+    ppo_micro_batch_size_per_gpu: 1
+    use_dynamic_bsz: true
+    ppo_max_token_len_per_gpu: 32768
+    # DAPO decoupled asymmetric clipping (Clip-Higher prevents diagnostic entropy collapse)
+    clip_ratio_low: 0.20
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean       # Normalize strictly over active assistant tokens
+    use_kl_loss: true
+    kl_loss_coef: 0.01              # Reference logprobs come free by disabling LoRA adapter
+    kl_loss_type: low_var_kl
+    optim:
+      lr: 5.0e-6
+      lr_warmup_steps: 30
+      weight_decay: 0.01
+      grad_clip: 1.0
+
+  rollout:
+    name: sglang
+    tensor_model_parallel_size: 2   # 2x TP2 SGLang instances across the 4x H100 GPUs
+    gpu_memory_utilization: 0.72
+    kv_cache_dtype: fp8_e4m3        # Only 16/64 layers use KV cache (~2.0 GB per 64K trace in FP8!)
+    n: 8                            # Group size G=8 trajectories per incident scenario
+    temperature: 1.0
+    top_p: 0.95
+    multi_turn:
+      enable: true
+      max_assistant_turns: 24
+      preserve_thinking: true
+      tool_config_path: configs/tools/sre_tool_config.yaml
+    engine_kwargs:
+      sglang:
+        attention_backend: flashinfer
+        chunked_prefill_size: 32768
+        reasoning_parser: qwen3
+        tool_call_parser: qwen3_coder
+
+algorithm:
+  adv_estimator: grpo               # Extended via GTPO discounted turn shaping + DAPO group filter
+  gamma: 0.92                       # GTPO turn discount factor
+  outcome_dampening_lambda: 0.30
+  filter_groups:
+    enable: true                    # DAPO dynamic zero-variance group filtering
+    metric: seq_final_reward
+    min_std: 1.0e-4
+    max_num_gen_batches: 6
+
+custom_reward_function:
+  path: src/sre_rl/verl_ext/reward_manager.py
+  name: compute_score
+
+trainer:
+  project_name: qwen38-27b-sre-rlvr
+  experiment_name: stage2-tier1-dapo-gtpo-4xh100
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_training_steps: 800
+  test_freq: 50
+  save_freq: 100
+  default_local_dir: /mnt/nvme/checkpoints/qwen38-27b-sre-stage2-rl
+  logger: ["console", "wandb"]

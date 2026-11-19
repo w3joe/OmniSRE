@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qwen38-sre-rl"
+version = "0.1.0"
+description = "RLVR post-training pipeline (Multi-Turn DAPO + GTPO) for Qwen3.8-27B Dense autonomous SRE agents on GCP 4x H100 (a3-highgpu-4g)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Tan Wee Joe", email = "84664178+w3joe@users.noreply.github.com" },
+]
+dependencies = [
+    "numpy>=2.0.0",
+    "pydantic>=2.8.0",
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+data = [
+    "pyarrow>=17.0.0",
+    "datasets>=3.0.0",
+]
+train = [
+    "torch>=2.5.0",
+    "transformers>=5.8.0",
+    "peft>=0.14.0",
+    "accelerate>=1.2.0",
+    "trl>=0.14.0",
+    "pyarrow>=17.0.0",
+    "datasets>=3.0.0",
+    "wandb>=0.19.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+sre-build-datasets = "sre_rl.cli:main_build_datasets"
+sre-eval = "sre_rl.cli:main_eval"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sre_rl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

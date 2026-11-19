@@ -1,0 +1,56 @@
+# Stage 1: Cold-Start SFT Config for Qwen/Qwen3.8-27B (Dense) on GCP a3-highgpu-4g (4x H100 80GB)
+model:
+  model_name_or_path: Qwen/Qwen3.8-27B
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: flash_attention_2
+  # Freeze native VLM encoder & MTP heads to save ~18% VRAM & preserve visual priors
+  freeze_vision_tower: true
+  freeze_mtp_heads: true
+
+lora:
+  enabled: true
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  # Adapts BOTH 16 Gated Attention layers AND 48 Gated DeltaNet linear-attention layers + SwiGLU FFN
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - in_proj_qkvz
+    - in_proj_ba
+    - in_proj
+    - out_proj
+    - ba_proj
+  exclude_modules:
+    - ".*visual.*"
+    - ".*vision_tower.*"
+    - ".*merger.*"
+    - ".*mtp.*"
+
+data:
+  train_jsonl: /mnt/nvme/data/sft_coldstart_train.jsonl
+  max_seq_length: 32768
+  assistant_only_loss: true
+  preserve_thinking: true
+
+training:
+  output_dir: /mnt/nvme/checkpoints/qwen38-27b-sre-sft-lora64
+  num_train_epochs: 2
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8   # Effective global batch size = 32 trajectories across 4x H100
+  learning_rate: 5.0e-5
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.08
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 5
+  save_steps: 100
+  seed: 42

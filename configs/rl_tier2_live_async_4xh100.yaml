@@ -1,0 +1,97 @@
+# Stage 3: Tier-2 Live Kubernetes Cluster Async RLVR on GCP a3-highgpu-4g
+# Splits 4x H100 into:
+#   - GPUs 0,1: SGLang TP2 Async Rollout Server (driving 10 concurrent Kind clusters on 104 vCPUs)
+#   - GPUs 2,3: FSDP2 LoRA Policy Trainer (bounded staleness <= 1 step)
+
+data:
+  train_files:
+    - /mnt/nvme/data/rl_tier2_live_train.parquet   # 70% Live Kind/SREGym scenarios
+    - /mnt/nvme/data/rl_tier1_train.parquet        # 30% Tier-1 Snapshot anti-forgetting replay
+  val_files: /mnt/nvme/data/rl_tier1_heldout.parquet
+  train_batch_size: 16
+  max_prompt_length: 4096
+  max_response_length: 32768
+
+async_policy:
+  enable: true
+  rollout_gpus: [0, 1]
+  trainer_gpus: [2, 3]
+  staleness_threshold: 1.0
+  weight_sync_interval_steps: 2
+
+actor_rollout_ref:
+  model:
+    path: /mnt/nvme/checkpoints/qwen38-27b-sre-stage2-merged
+    trust_remote_code: true
+    enable_gradient_checkpointing: true
+    lora:
+      type: vlm_lora
+      merge: true
+      rank: 64
+      alpha: 64
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: true
+      target_modules:
+        - q_proj
+        - k_proj
+        - v_proj
+        - o_proj
+        - gate_proj
+        - up_proj
+        - down_proj
+        - in_proj_qkvz
+        - in_proj_ba
+        - in_proj
+        - out_proj
+        - ba_proj
+
+  actor:
+    strategy: fsdp2
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    clip_ratio_low: 0.20
+    clip_ratio_high: 0.28
+    loss_agg_mode: token-mean
+    use_kl_loss: true
+    kl_loss_coef: 0.015
+    optim:
+      lr: 2.5e-6
+      lr_warmup_steps: 15
+      grad_clip: 1.0
+
+  rollout:
+    name: sglang
+    tensor_model_parallel_size: 2
+    gpu_memory_utilization: 0.80
+    kv_cache_dtype: fp8_e4m3
+    n: 8
+    multi_turn:
+      enable: true
+      max_assistant_turns: 30
+      preserve_thinking: true
+      tool_config_path: configs/tools/sre_tool_config.yaml
+
+algorithm:
+  adv_estimator: grpo
+  gamma: 0.92
+  outcome_dampening_lambda: 0.30
+  filter_groups:
+    enable: true
+    metric: seq_final_reward
+    min_std: 1.0e-4
+
+custom_reward_function:
+  path: src/sre_rl/verl_ext/reward_manager.py
+  name: compute_score
+
+trainer:
+  project_name: qwen38-27b-sre-rlvr
+  experiment_name: stage3-tier2-live-k8s-async-4xh100
+  nnodes: 1
+  n_gpus_per_node: 4
+  total_training_steps: 300
+  test_freq: 25
+  save_freq: 50
+  default_local_dir: /mnt/nvme/checkpoints/qwen38-27b-sre-stage3-final
+  logger: ["console", "wandb"]

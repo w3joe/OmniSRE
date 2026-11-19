@@ -1,0 +1,179 @@
+# Multi-Turn SRE Tool Declarations for `verl` + SGLang (`qwen3_coder` tool parser)
+router:
+  class_name: sre_rl.verl_ext.sre_tool.SREMultiTurnToolRouter
+  mode: tier1
+  max_turns: 24
+  max_output_chars: 12000
+
+tools:
+  - name: query_metrics
+    category: read
+    description: Query Prometheus/VictoriaMetrics time-series and SLO breach status for services.
+    parameters:
+      type: object
+      properties:
+        service:
+          type: string
+          description: Optional microservice name filter.
+        metric:
+          type: string
+          description: Optional metric substring (e.g. http_requests_error_ratio, p99_ms).
+      required: []
+
+  - name: search_logs
+    category: read
+    description: Search structured service logs by service name, severity level, and regex pattern.
+    parameters:
+      type: object
+      properties:
+        service:
+          type: string
+        level:
+          type: string
+          enum: [INFO, WARN, ERROR]
+        pattern:
+          type: string
+      required: []
+
+  - name: get_traces
+    category: read
+    description: Inspect OpenTelemetry distributed trace spans for high latency or 5xx errors.
+    parameters:
+      type: object
+      properties:
+        service:
+          type: string
+        errors_only:
+          type: boolean
+      required: []
+
+  - name: k8s_inspect
+    category: read
+    description: Read Kubernetes resource specs, statuses, and warning events in a namespace.
+    parameters:
+      type: object
+      properties:
+        namespace:
+          type: string
+        kind:
+          type: string
+        name:
+          type: string
+      required: []
+
+  - name: host_diag
+    category: read
+    description: Run allowlisted read-only host/socket/disk diagnostics (iostat, ss, loadavg).
+    parameters:
+      type: object
+      properties:
+        service:
+          type: string
+        check:
+          type: string
+      required: [service]
+
+  - name: git_recent_changes
+    category: read
+    description: Inspect recent GitOps and application deployment commits for a service.
+    parameters:
+      type: object
+      properties:
+        service:
+          type: string
+      required: []
+
+  - name: search_runbooks
+    category: read
+    description: Search SRE operational runbooks by symptom, service, or resource type.
+    parameters:
+      type: object
+      properties:
+        query:
+          type: string
+      required: [query]
+
+  - name: apply_remediation
+    category: write
+    description: Patch a Kubernetes Deployment or ConfigMap after confirming root cause (>=2 reads required).
+    parameters:
+      type: object
+      properties:
+        namespace:
+          type: string
+        target_object:
+          type: string
+        patch:
+          type: object
+      required: [namespace, target_object, patch]
+
+  - name: rollback_release
+    category: write
+    description: Roll back a Deployment to its previous stable revision after confirming a canary regression.
+    parameters:
+      type: object
+      properties:
+        namespace:
+          type: string
+        deployment:
+          type: string
+      required: [namespace, deployment]
+
+  - name: scale_resource
+    category: write
+    description: Adjust replica count of a Deployment (e.g. to drain a metastable retry storm backlog).
+    parameters:
+      type: object
+      properties:
+        namespace:
+          type: string
+        workload:
+          type: string
+        replicas:
+          type: integer
+      required: [namespace, workload, replicas]
+
+  - name: restart_workload
+    category: write
+    description: Rolling restart pods of a workload (ineffective on persistent config/code defects).
+    parameters:
+      type: object
+      properties:
+        namespace:
+          type: string
+        workload:
+          type: string
+      required: [workload]
+
+  - name: submit_incident_report
+    category: terminal
+    description: Conclude the episode with triage classification, localized root object, and causal RCA.
+    parameters:
+      type: object
+      properties:
+        classification:
+          type: string
+          enum: [real_incident, benign_false_alarm, external_escalation]
+        root_namespace:
+          type: string
+        root_service:
+          type: string
+        root_object:
+          type: string
+        causal_mechanism:
+          type: string
+        remediation_summary:
+          type: string
+      required: [classification, root_service, causal_mechanism]
+
+  - name: escalate_to_human
+    category: terminal
+    description: Escalate incidents caused by external third-party outages or beyond RBAC scope.
+    parameters:
+      type: object
+      properties:
+        reason:
+          type: string
+        upstream_provider:
+          type: string
+      required: [reason]

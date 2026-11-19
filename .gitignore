@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Datasets, Checkpoints & Logs
+data/generated/
+outputs/
+checkpoints/
+wandb/
+*.parquet
+*.jsonl
+*.pt
+*.safetensors
+*.gguf
+
+# Terraform & GCP
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!terraform.tfvars.example
+
+# OS
+.DS_Store
