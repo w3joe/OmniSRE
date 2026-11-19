@@ -3,7 +3,7 @@ model:
   model_name_or_path: Qwen/Qwen3.8-27B
   trust_remote_code: true
   torch_dtype: bfloat16
-  attn_implementation: flash_attention_2
+  attn_implementation: sdpa
   # Freeze native VLM encoder & MTP heads to save ~18% VRAM & preserve visual priors
   freeze_vision_tower: true
   freeze_mtp_heads: true
@@ -46,7 +46,7 @@ training:
   gradient_accumulation_steps: 8   # Effective global batch size = 32 trajectories across 4x H100
   learning_rate: 5.0e-5
   lr_scheduler_type: cosine
-  warmup_ratio: 0.08
+  warmup_steps: 15
   weight_decay: 0.01
   max_grad_norm: 1.0
   bf16: true

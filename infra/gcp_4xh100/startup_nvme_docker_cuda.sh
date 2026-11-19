@@ -8,7 +8,7 @@ set -euo pipefail
 NVME_MOUNT="/mnt/nvme"
 
 if ! mountpoint -q "${NVME_MOUNT}"; then
-  apt-get update -y && apt-get install -y mdadm xfsprogs jq rsync
+  apt-get update -y && apt-get install -y mdadm xfsprogs jq rsync python3-dev build-essential
   NVME_DEVS=($(ls /dev/disk/by-id/google-local-nvme-ssd-* 2>/dev/null || true))
   if [[ ${#NVME_DEVS[@]} -gt 0 ]]; then
     if [[ ! -e /dev/md0 ]]; then
@@ -29,6 +29,12 @@ mkdir -p \
   "${NVME_MOUNT}/checkpoints" \
   "${NVME_MOUNT}/wandb" \
   "${NVME_MOUNT}/docker" \
+  "${NVME_MOUNT}/kind-leases"
+chmod 1777 \
+  "${NVME_MOUNT}/hf_cache" \
+  "${NVME_MOUNT}/data" \
+  "${NVME_MOUNT}/checkpoints" \
+  "${NVME_MOUNT}/wandb" \
   "${NVME_MOUNT}/kind-leases"
 
 # Mandatory sysctl tuning for multi-cluster Kind + high-concurrency SGLang HTTP workers
