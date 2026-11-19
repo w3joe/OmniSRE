@@ -64,15 +64,17 @@ def main() -> None:
     beatsprom_rows = scraper.scrape_beatsprom_k8s_sre(max_records=args.beatsprom_max)
     print(f"      -> collected {len(beatsprom_rows)} K8s RCA + DPO traces", flush=True)
 
-    print("[4/7] Scraping nolabs/deepfabric + Snaseem2026/devops-incident-response...", flush=True)
+    print("[4/8] Scraping nolabs/deepfabric + Snaseem2026 + ibm-research/ITBench-Trajectories...", flush=True)
     deepfabric_rows = scraper.scrape_deepfabric_devops(max_records=args.deepfabric_max)
     snaseem_rows = scraper.scrape_snaseem_incidents(max_records=args.snaseem_max)
+    itbench_rows = scraper.scrape_itbench_trajectories(max_sessions=105, min_judge_score=0.25)
     print(
-        f"      -> collected {len(deepfabric_rows)} deepfabric + {len(snaseem_rows)} snaseem incidents",
+        f"      -> collected {len(deepfabric_rows)} deepfabric + {len(snaseem_rows)} snaseem "
+        f"+ {len(itbench_rows)} ITBench SRE traces",
         flush=True,
     )
 
-    print("[5/7] Scraping production runbooks & PromQL rules (OpenShift, Kube-Prom, Awesome-Prom, SREGym)...", flush=True)
+    print("[5/8] Scraping production runbooks, PromQL rules, SREGym & postmortems...", flush=True)
     prom_rules = scraper.scrape_awesome_prometheus_alerts()
     ocp_runbooks = scraper.scrape_github_runbook_tarball(
         "openshift/runbooks", "master", "alerts/", license_id="Apache-2.0"
@@ -81,25 +83,45 @@ def main() -> None:
         "prometheus-operator/runbooks", "main", "content/runbooks/", license_id="Apache-2.0"
     )
     sregym_specs = scraper.scrape_sregym_fault_specs()
+    postmortems = scraper.scrape_danluu_postmortems()
     all_runbooks = ocp_runbooks + kprom_runbooks
     print(
         f"      -> collected {len(prom_rules)} PromQL rules, {len(all_runbooks)} production runbooks, "
-        f"{len(sregym_specs)} SREGym fault specs",
+        f"{len(sregym_specs)} SREGym fault specs, {len(postmortems)} postmortems",
         flush=True,
     )
 
-    print("[6/7] Building grounded RLVR scenarios + benign/adversarial safety balance...", flush=True)
+    print("[6/8] Building de-contaminated grounded RLVR splits + train-only SFT balance...", flush=True)
     grounded_scenarios = scraper.build_grounded_rlvr_scenarios_from_kb(
         runbooks=all_runbooks,
         promql_rules=prom_rules,
         max_scenarios=args.grounded_rl_scenarios,
     )
-
-    # Add benign false-alarm, external-escalation, metastable, & prompt-injection safety balance
     synth_suite = generate_scenario_suite(num_scenarios=args.synthetic_safety_balance, seed=101)
+
+    # Split ALL RL scenarios deterministically by topology_name FIRST so train SFT never leaks held-out!
+    all_rl_scenarios = grounded_scenarios + synth_suite
+    rl_train, rl_val, rl_heldout = [], [], []
+    for sc in all_rl_scenarios:
+        bucket = int(hashlib.sha256(sc.topology_name.encode("utf-8")).hexdigest()[:8], 16) % 100
+        if bucket < 15 or sc.topology_name == "checkout-aurora-stack":
+            rl_heldout.append(sc)
+        elif bucket < 25:
+            rl_val.append(sc)
+        else:
+            rl_train.append(sc)
+
     safety_sft_rows = []
-    for sc in synth_suite:
-        if (
+    grounded_sft_rows = []
+    for sc in rl_train:
+        if sc.scenario_id.startswith("real-"):
+            if len(grounded_sft_rows) < 400:
+                traj = synthesize_expert_trajectory(sc)
+                traj["source"] = "grounded_openshift_promql_runbook_trace"
+                traj["license"] = "Apache-2.0"
+                traj["messages"] = purify_trajectory(traj["messages"])
+                grounded_sft_rows.append(traj)
+        elif (
             sc.fault.classification != IncidentClassification.REAL_INCIDENT
             or sc.fault.contains_adversarial_log_injection
             or sc.fault.requires_secondary_drain_or_scale
@@ -110,41 +132,24 @@ def main() -> None:
             traj["messages"] = purify_trajectory(traj["messages"])
             safety_sft_rows.append(traj)
 
-    # Also synthesize purified multi-turn gold SFT traces from a slice of the real runbook scenarios
-    grounded_sft_rows = []
-    for sc in grounded_scenarios[:300]:
-        traj = synthesize_expert_trajectory(sc)
-        traj["source"] = "grounded_openshift_promql_runbook_trace"
-        traj["license"] = "Apache-2.0"
-        traj["messages"] = purify_trajectory(traj["messages"])
-        grounded_sft_rows.append(traj)
-
-    # Combine & deterministically split RLVR scenarios (15% unseen component/alert family held-out)
-    all_rl_scenarios = grounded_scenarios + synth_suite
-    rl_train, rl_val, rl_heldout = [], [], []
-    for sc in all_rl_scenarios:
-        bucket = int(hashlib.sha256(sc.topology_name.encode("utf-8")).hexdigest()[:8], 16) % 100
-        if bucket < 15:
-            rl_heldout.append(sc)
-        elif bucket < 25:
-            rl_val.append(sc)
-        else:
-            rl_train.append(sc)
-
-    print("[7/7] Writing scrubbed & deduplicated Dataset v2 artifacts...", flush=True)
+    print("[7/8] Writing scrubbed & deduplicated Dataset v2 artifacts...", flush=True)
     sft_corpus = (
         rmems_rows
         + miyad_rows
         + beatsprom_rows
         + deepfabric_rows
         + snaseem_rows
+        + itbench_rows
         + grounded_sft_rows
         + safety_sft_rows
     )
     scraper.rng.shuffle(sft_corpus)
 
     sft_path = export_jsonl(sft_corpus, out / "sft_real_sre_corpus.jsonl")
-    kb_path = export_jsonl(prom_rules + all_runbooks + sregym_specs, out / "production_runbooks_promql_kb.jsonl")
+    kb_path = export_jsonl(
+        prom_rules + all_runbooks + sregym_specs + postmortems,
+        out / "production_runbooks_promql_kb.jsonl",
+    )
     rl_train_path = export_parquet_or_jsonl([to_verl_rl_row(s) for s in rl_train], out / "rl_real_train.parquet")
     rl_val_path = export_parquet_or_jsonl([to_verl_rl_row(s) for s in rl_val], out / "rl_real_val.parquet")
     rl_heldout_path = export_parquet_or_jsonl([to_verl_rl_row(s) for s in rl_heldout], out / "rl_real_heldout.parquet")
@@ -156,7 +161,7 @@ def main() -> None:
 
     report = {
         "total_sft_trajectories": len(sft_corpus),
-        "total_kb_entries": len(prom_rules) + len(all_runbooks) + len(sregym_specs),
+        "total_kb_entries": len(prom_rules) + len(all_runbooks) + len(sregym_specs) + len(postmortems),
         "total_rl_scenarios": len(all_rl_scenarios),
         "rl_train_scenarios": len(rl_train),
         "rl_val_scenarios": len(rl_val),
@@ -178,7 +183,19 @@ def main() -> None:
         },
     }
     (out / "dataset_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(report, indent=2))
+    print(json.dumps(report, indent=2), flush=True)
+
+    print("[8/8] Running 5-Gate Dataset Validator (PII, Tool JSON, Oracle, De-Contamination, Mix)...", flush=True)
+    from dataclasses import asdict
+
+    from sre_rl.data.validator import validate_dataset_directory
+
+    val_report = validate_dataset_directory(
+        dataset_dir=out,
+        oracle_sample_size=150,
+        auto_filter_invalid_sft=True,
+    )
+    print(json.dumps(asdict(val_report), indent=2), flush=True)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,40 @@
 
 from sre_rl.data.scraper import RealSREDatasetScraper, _normalize_tool_name
 from sre_rl.data.trajectory_builder import synthesize_expert_trajectory
+from sre_rl.data.validator import scan_text_for_leaks, validate_sft_row
+
+
+def test_validator_catches_leaks_and_malformed_tool_calls() -> None:
+    leaks = scan_text_for_leaks("leak AKIAIOSFODNN7EXAMPLE and ops@company.io and 10.1.2.3")
+    assert leaks["AWS_KEY"] == 1
+    assert leaks["EMAIL"] == 1
+    assert leaks["IPV4"] == 1
+
+    clean = scan_text_for_leaks("clean <REDACTED_AWS_KEY> and <EMAIL_ab12cd> and 127.0.0.1")
+    assert clean == {}
+
+    good_row = {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "alert"},
+            {
+                "role": "assistant",
+                "content": '<think>check metrics</think>\n<tool_call>{"name": "query_metrics", "arguments": {}}</tool_call>',
+            },
+        ]
+    }
+    ok, errs, toks, has_tc = validate_sft_row(good_row)
+    assert ok is True and errs == [] and toks > 0 and has_tc is True
+
+    bad_row = {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "alert"},
+            {"role": "assistant", "content": "<think>unclosed thinking..."},
+        ]
+    }
+    ok2, errs2, _, _ = validate_sft_row(bad_row)
+    assert ok2 is False and any("unclosed_think_block" in e for e in errs2)
 
 
 def test_tool_name_normalization() -> None:

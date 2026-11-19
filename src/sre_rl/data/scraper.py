@@ -610,6 +610,11 @@ class RealSREDatasetScraper:
                             }
                         )
 
+        # Scrub any secrets inside PromQL alert rules too
+        for rule in rules_out:
+            rule["description"] = self.scrubber.scrub_text(rule["description"])
+            rule["promql"] = self.scrubber.scrub_text(rule["promql"])
+
         self.stats.source_counts["samber/awesome-prometheus-alerts"] = len(rules_out)
         return rules_out
 
@@ -694,8 +699,10 @@ class RealSREDatasetScraper:
                             "license": "MIT",
                             "problem_id": prob_id,
                             "path": rel,
-                            "summary": docstring[:1000] or prob_id.replace("_", " "),
-                            "code_excerpt": code[:2000],
+                            "summary": self.scrubber.scrub_text(
+                                docstring[:1000] or prob_id.replace("_", " ")
+                            ),
+                            "code_excerpt": self.scrubber.scrub_text(code[:2000]),
                         }
                     )
         except Exception as exc:  # noqa: BLE001
@@ -703,6 +710,210 @@ class RealSREDatasetScraper:
 
         self.stats.source_counts["SREGym/SREGym"] = len(specs)
         return specs
+
+    # ------------------------------------------------------------------
+    # Source 9: ibm-research/ITBench-Trajectories (Real SRE ReAct runs)
+    # ------------------------------------------------------------------
+    def scrape_itbench_trajectories(
+        self,
+        max_sessions: int = 105,
+        min_judge_score: float = 0.25,
+    ) -> list[dict[str, Any]]:
+        """Download real IBM Research ITBench SRE ReAct trajectories & normalize tool calls."""
+        results: list[dict[str, Any]] = []
+        try:
+            info = _http_get_json(
+                "https://huggingface.co/api/datasets/ibm-research/ITBench-Trajectories"
+            )
+            all_files = {s["rfilename"] for s in info.get("siblings", [])}
+            sre_sessions = sorted(
+                f for f in all_files if "/sre/" in f and f.endswith("session.jsonl")
+            )[:max_sessions]
+        except Exception as exc:  # noqa: BLE001
+            self.stats.errors.append(f"itbench_list_error: {exc}")
+            return results
+
+        def _fetch_session(sess_path: str) -> dict[str, Any] | None:
+            base_dir = sess_path.rsplit("/", 1)[0]
+            judge_path = f"{base_dir}/judge_output.json"
+            judge_score = 1.0
+            if judge_path in all_files:
+                try:
+                    j_url = (
+                        "https://huggingface.co/datasets/ibm-research/"
+                        f"ITBench-Trajectories/resolve/main/{judge_path}"
+                    )
+                    j_obj = _http_get_json(j_url, timeout=20)
+                    scores = (j_obj.get("eval_result") or {}).get("scores") or {}
+                    rc_score = scores.get("root_cause_entity") or {}
+                    f1 = rc_score.get("f1", rc_score.get("recall", rc_score.get("accuracy")))
+                    if isinstance(f1, (int, float)):
+                        judge_score = float(f1)
+                except Exception:  # noqa: BLE001
+                    judge_score = 0.5
+
+            if judge_score < min_judge_score:
+                return None
+
+            s_url = (
+                "https://huggingface.co/datasets/ibm-research/"
+                f"ITBench-Trajectories/resolve/main/{sess_path}"
+            )
+            try:
+                raw_lines = _http_get_bytes(s_url, timeout=30).decode("utf-8", errors="ignore").splitlines()
+            except Exception:  # noqa: BLE001
+                return None
+
+            user_goal = ""
+            pending_thought = ""
+            messages: list[dict[str, str]] = [
+                {"role": "system", "content": build_sre_system_prompt(ReasoningEffort.HIGH)}
+            ]
+            turn_count = 0
+
+            for ln in raw_lines:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    ev = json.loads(ln)
+                except json.JSONDecodeError:
+                    continue
+                ev_type = ev.get("type")
+                payload = ev.get("payload") or {}
+                p_type = payload.get("type")
+
+                if ev_type == "event_msg" and p_type == "user_message" and not user_goal:
+                    user_goal = str(payload.get("message", "")).strip()
+                    if user_goal:
+                        messages.append({"role": "user", "content": user_goal[:3000]})
+                elif ev_type == "response_item" and p_type == "reasoning":
+                    summary = payload.get("summary") or []
+                    if isinstance(summary, list):
+                        parts = [
+                            str(x.get("text", x)) if isinstance(x, dict) else str(x)
+                            for x in summary
+                        ]
+                        txt = " ".join(p.strip() for p in parts if p.strip())
+                    else:
+                        txt = str(payload.get("content") or summary or "").strip()
+                    if txt:
+                        pending_thought = txt[:1000]
+                elif ev_type == "response_item" and p_type == "function_call":
+                    if not user_goal:
+                        user_goal = f"Investigate and diagnose ITBench SRE incident ({base_dir})."
+                        messages.append({"role": "user", "content": user_goal})
+                    if turn_count >= 22:
+                        continue
+                    tname = _normalize_tool_name(str(payload.get("name", "host_diag")))
+                    raw_args = payload.get("arguments", {})
+                    if isinstance(raw_args, str):
+                        try:
+                            raw_args = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            raw_args = {"command": raw_args[:1200]}
+                    if not isinstance(raw_args, dict):
+                        raw_args = {"input": str(raw_args)[:1200]}
+                    thought = pending_thought or f"Execute {tname} to inspect cluster telemetry."
+                    pending_thought = ""
+                    call_json = json.dumps({"name": tname, "arguments": raw_args})
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": f"<think>{thought}</think>\n<tool_call>{call_json}</tool_call>",
+                        }
+                    )
+                    turn_count += 1
+                elif (
+                    ev_type == "response_item"
+                    and p_type == "function_call_output"
+                    and messages
+                    and messages[-1]["role"] == "assistant"
+                ):
+                    obs = str(payload.get("output", "")).strip()[:2800]
+                    messages.append(
+                        {"role": "user", "content": f"<tool_response>\n{obs}\n</tool_response>"}
+                    )
+
+            if turn_count < 2:
+                return None
+
+            # Ensure conversation ends on an assistant turn
+            if messages[-1]["role"] == "user":
+                close_call = json.dumps(
+                    {
+                        "name": "submit_incident_report",
+                        "arguments": {
+                            "classification": "real_incident",
+                            "root_service": base_dir.split("/")[-2],
+                            "causal_mechanism": "ITBench SRE root-cause localization completed.",
+                        },
+                    }
+                )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "<think>Evidence gathered across cluster telemetry; submit root cause report.</think>\n"
+                            f"<tool_call>{close_call}</tool_call>"
+                        ),
+                    }
+                )
+
+            return {
+                "id": f"itbench-{base_dir.replace('/', '_')}",
+                "source": "ibm-research/ITBench-Trajectories",
+                "license": "Apache-2.0",
+                "judge_score": round(judge_score, 3),
+                "reasoning_effort": ReasoningEffort.HIGH.value,
+                "num_turns": sum(1 for m in messages if m["role"] == "assistant"),
+                "messages": messages,
+            }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+            for item in pool.map(_fetch_session, sre_sessions):
+                if item is None:
+                    self.stats.quality_skipped += 1
+                    continue
+                if not self._register_unique(f"itbench:{item['id']}"):
+                    continue
+                item["messages"] = self._scrub_messages(item["messages"])
+                results.append(item)
+
+        self.stats.source_counts["ibm-research/ITBench-Trajectories"] = len(results)
+        return results
+
+    # ------------------------------------------------------------------
+    # Source 10: danluu/post-mortems (Real Production Outage Index)
+    # ------------------------------------------------------------------
+    def scrape_danluu_postmortems(self) -> list[dict[str, Any]]:
+        url = "https://raw.githubusercontent.com/danluu/post-mortems/master/README.md"
+        entries: list[dict[str, Any]] = []
+        try:
+            text = _http_get_bytes(url, timeout=20).decode("utf-8", errors="ignore")
+            link_re = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)\.\s*(.+)")
+            for idx, line in enumerate(text.splitlines()):
+                m = link_re.search(line.strip())
+                if not m:
+                    continue
+                title, link, summary = m.group(1).strip(), m.group(2).strip(), m.group(3).strip()
+                if len(summary) < 30:
+                    continue
+                entries.append(
+                    {
+                        "kb_type": "real_outage_postmortem",
+                        "source": "danluu/post-mortems",
+                        "postmortem_id": f"pm-{idx:04d}",
+                        "title": self.scrubber.scrub_text(title),
+                        "url": link,
+                        "summary": self.scrubber.scrub_text(summary[:1500]),
+                    }
+                )
+        except Exception as exc:  # noqa: BLE001
+            self.stats.errors.append(f"danluu_postmortems_error: {exc}")
+
+        self.stats.source_counts["danluu/post-mortems"] = len(entries)
+        return entries
 
     # ------------------------------------------------------------------
     # Grounding: Convert Scraped Production Runbooks + PromQL Alerts into
