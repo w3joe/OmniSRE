@@ -61,8 +61,10 @@ def main() -> None:
 
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
+    import json
+
     import torch
-    from datasets import load_dataset
+    from datasets import Dataset
     from peft import LoraConfig, get_peft_model
     from transformers import AutoModelForImageTextToText, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
@@ -102,18 +104,23 @@ def main() -> None:
     model.print_trainable_parameters()
 
     # 3. Load cold-start SRE trajectories & apply bounded `preserve_thinking`
-    train_jsonl_path = str(args.train_jsonl) if args.train_jsonl is not None else cfg["data"]["train_jsonl"]
-    raw_ds = load_dataset("json", data_files=train_jsonl_path, split="train")
+    # Load via Python dict projection (`{"messages": ...}`) so heterogeneous metadata columns
+    # across multi-source scraped corpora never trigger PyArrow chunk CastError.
+    train_jsonl_path = Path(args.train_jsonl) if args.train_jsonl is not None else Path(cfg["data"]["train_jsonl"])
     preserve = bool(cfg["data"].get("preserve_thinking", True))
-
-    def _format_row(example):
-        msgs = format_multiturn_preserve_thinking(
-            example["messages"], preserve_thinking=preserve
-        )
-        text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
-        return {"text": text}
-
-    train_ds = raw_ds.map(_format_row, remove_columns=raw_ds.column_names)
+    formatted_texts: list[dict[str, str]] = []
+    with train_jsonl_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            msgs = format_multiturn_preserve_thinking(
+                row["messages"], preserve_thinking=preserve
+            )
+            text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            formatted_texts.append({"text": text})
+    train_ds = Dataset.from_list(formatted_texts)
 
     t_cfg = cfg["training"]
     out_dir = str(args.output_dir) if args.output_dir is not None else t_cfg["output_dir"]
