@@ -58,6 +58,30 @@ def _compute_Selected_logprobs(
     return torch.cat([pad_zero, token_lp], dim=0)
 
 
+def _chat_template_ids(
+    tokenizer,
+    messages: list[dict[str, str]],
+    add_generation_prompt: bool,
+) -> list[int]:
+    """Handle both transformers v4 (`list[int]`) and v5 (`BatchEncoding`) return types."""
+    encoded = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
+    )
+    if isinstance(encoded, list):
+        return [int(t) for t in encoded]
+    if hasattr(encoded, "input_ids"):
+        ids = encoded.input_ids
+    elif isinstance(encoded, dict) and "input_ids" in encoded:
+        ids = encoded["input_ids"]
+    else:
+        raise TypeError(f"Unexpected apply_chat_template output type: {type(encoded)}")
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return [int(t) for t in ids]
+
+
 @torch.no_grad()
 def rollout_multi_turn_episode(
     unwrapped_model,
@@ -79,16 +103,16 @@ def rollout_multi_turn_episode(
         {"role": "user", "content": initial_alert},
     ]
 
-    full_ids: list[int] = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=False
+    full_ids: list[int] = _chat_template_ids(
+        tokenizer, messages, add_generation_prompt=False
     )
     turn_spans: list[tuple[int, int]] = []
     turn_rewards: list[float] = []
 
     for _ in range(max_turns):
         formatted_msgs = format_multiturn_preserve_thinking(messages, preserve_thinking=True)
-        prompt_ids: list[int] = tokenizer.apply_chat_template(
-            formatted_msgs, tokenize=True, add_generation_prompt=True
+        prompt_ids: list[int] = _chat_template_ids(
+            tokenizer, formatted_msgs, add_generation_prompt=True
         )
         if len(prompt_ids) >= max_seq_len - max_new_tokens_per_turn:
             break
@@ -99,9 +123,9 @@ def rollout_multi_turn_episode(
             input_ids=inp,
             attention_mask=attn_mask,
             max_new_tokens=max_new_tokens_per_turn,
-            do_sample=True,
-            temperature=temperature,
-            top_p=0.95,
+            do_sample=(temperature > 0.0),
+            temperature=temperature if temperature > 0.0 else None,
+            top_p=0.95 if temperature > 0.0 else None,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
             use_cache=True,
@@ -157,7 +181,9 @@ def main() -> None:
         type=Path,
         default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-rl-dapo-gtpo"),
     )
-    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--max-scenario-attempts", type=int, default=60)
+    parser.add_argument("--eval-heldout-count", type=int, default=12)
     parser.add_argument("--rollouts-per-gpu", type=int, default=2)
     parser.add_argument("--max-turns", type=int, default=8)
     parser.add_argument("--lr", type=float, default=5e-6)
@@ -210,9 +236,41 @@ def main() -> None:
         weight_decay=0.01,
     )
 
-    scenarios = split_scenarios_decontaminated(
+    splits = split_scenarios_decontaminated(
         generate_scenario_suite(num_scenarios=400, seed=args.seed)
-    ).train
+    )
+    scenarios = splits.train
+    heldout_eval_scenarios = splits.eval_heldout[: args.eval_heldout_count]
+
+    def _run_distributed_heldout_eval(label: str) -> dict[str, float]:
+        local_eval_stats = []
+        for idx, sc in enumerate(heldout_eval_scenarios):
+            if idx % world_size != local_rank:
+                continue
+            _, _, st = rollout_multi_turn_episode(
+                unwrapped_model=peft_model,
+                tokenizer=tokenizer,
+                scenario=sc,
+                device=device,
+                max_turns=args.max_turns,
+                temperature=0.0,
+            )
+            local_eval_stats.append(st)
+        all_eval_lists: list[list[dict[str, float]]] = [None] * world_size  # type: ignore[list-item]
+        dist.all_gather_object(all_eval_lists, local_eval_stats)
+        flat = [x for sub in all_eval_lists for x in sub]
+        summary = {
+            "eval_stage": label,
+            "num_heldout": len(flat),
+            "mean_reward": round(float(np.mean([x["reward"] for x in flat])), 4),
+            "mitigation_rate": round(float(np.mean([x["mitigated"] for x in flat])), 4),
+            "safety_violation_rate": round(float(np.mean([x["safety_violated"] for x in flat])), 4),
+            "avg_turns": round(float(np.mean([x["turns"] for x in flat])), 2),
+        }
+        if local_rank == 0:
+            print(f"[heldout-eval] {json.dumps(summary)}", flush=True)
+        return summary
+
     dapo_cfg = DAPOConfig(
         group_size=world_size * args.rollouts_per_gpu,
         clip_eps_low=0.20,
@@ -221,11 +279,13 @@ def main() -> None:
         outcome_dampening_lambda=0.30,
     )
 
+    before_eval = _run_distributed_heldout_eval("before_rl_sft_checkpoint")
+
     completed_updates = 0
     filtered_zero_var = 0
     scenario_cursor = 0
 
-    while completed_updates < args.steps:
+    while completed_updates < args.steps and scenario_cursor < args.max_scenario_attempts:
         t0 = time.time()
         scenario = scenarios[scenario_cursor % len(scenarios)]
         scenario_cursor += 1
@@ -336,10 +396,24 @@ def main() -> None:
                 flush=True,
             )
 
+    after_eval = _run_distributed_heldout_eval("after_rl_dapo_gtpo")
+
     if local_rank == 0:
         args.output_dir.mkdir(parents=True, exist_ok=True)
         peft_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
+        (args.output_dir / "trial_eval_summary.json").write_text(
+            json.dumps(
+                {
+                    "completed_rl_updates": completed_updates,
+                    "filtered_zero_var_groups": filtered_zero_var,
+                    "before_rl": before_eval,
+                    "after_rl": after_eval,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
         print(f"[rlvr] Saved post-trained Qwen3.8-27B SRE LoRA adapter to {args.output_dir}")
 
     dist.destroy_process_group()
