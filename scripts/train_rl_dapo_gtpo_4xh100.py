@@ -45,17 +45,24 @@ from sre_rl.schemas import IncidentScenario
 def _compute_Selected_logprobs(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
+    chunk_size: int = 512,
 ) -> torch.Tensor:
-    """Compute per-token log-probabilities aligned with `input_ids` (`shape: [seq_len]`).
+    """Compute per-token log-probabilities in 512-token chunks to avoid 248K-vocab OOM."""
+    seq_len = input_ids.shape[1]
+    if seq_len <= 1:
+        return torch.zeros(seq_len, device=input_ids.device, dtype=torch.float32)
 
-    Position `t` stores `log P(input_ids[t] | input_ids[:t])` (`0.0` at `t=0`).
-    """
-    shift_logits = logits[:, :-1, :].float()
-    shift_labels = input_ids[:, 1:].unsqueeze(-1)
-    log_probs = torch.log_softmax(shift_logits, dim=-1)
-    token_lp = torch.gather(log_probs, dim=-1, index=shift_labels).squeeze(-1).squeeze(0)
-    pad_zero = torch.zeros(1, device=token_lp.device, dtype=token_lp.dtype)
-    return torch.cat([pad_zero, token_lp], dim=0)
+    chunks: list[torch.Tensor] = [
+        torch.zeros(1, device=input_ids.device, dtype=torch.float32)
+    ]
+    for start in range(0, seq_len - 1, chunk_size):
+        end = min(seq_len - 1, start + chunk_size)
+        sub_logits = logits[0, start:end, :].float()
+        sub_labels = input_ids[0, start + 1 : end + 1].unsqueeze(-1)
+        sub_lp = torch.log_softmax(sub_logits, dim=-1)
+        gathered = torch.gather(sub_lp, dim=-1, index=sub_labels).squeeze(-1)
+        chunks.append(gathered)
+    return torch.cat(chunks, dim=0)
 
 
 def _chat_template_ids(
@@ -341,14 +348,18 @@ def main() -> None:
             active_count = torch.clamp(mask_t.sum(), min=1.0)
 
             with torch.no_grad():
-                old_logits = peft_model(input_ids=input_ids).logits
+                old_logits = peft_model(input_ids=input_ids, use_cache=False).logits
                 old_lp = _compute_Selected_logprobs(old_logits, input_ids)
+                del old_logits
                 with peft_model.disable_adapter():
-                    ref_logits = peft_model(input_ids=input_ids).logits
+                    ref_logits = peft_model(input_ids=input_ids, use_cache=False).logits
                     ref_lp = _compute_Selected_logprobs(ref_logits, input_ids)
+                    del ref_logits
+            torch.cuda.empty_cache()
 
-            new_logits = ddp_model(input_ids=input_ids).logits
+            new_logits = ddp_model(input_ids=input_ids, use_cache=False).logits
             new_lp = _compute_Selected_logprobs(new_logits, input_ids)
+            del new_logits
 
             log_ratio = (new_lp - old_lp) * mask_t
             ratio = torch.exp(torch.clamp(log_ratio, -15.0, 15.0))
@@ -366,6 +377,8 @@ def main() -> None:
             loss = (policy_loss + kl_loss) / args.rollouts_per_gpu
             loss.backward()
             total_loss_val += float(loss.detach().cpu())
+            del loss, policy_loss, kl_loss, new_lp, old_lp, ref_lp
+            torch.cuda.empty_cache()
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0))
         optimizer.step()

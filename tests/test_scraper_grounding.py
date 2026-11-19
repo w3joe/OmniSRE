@@ -11,7 +11,10 @@ def test_validator_catches_leaks_and_malformed_tool_calls() -> None:
     assert leaks["EMAIL"] == 1
     assert leaks["IPV4"] == 1
 
-    clean = scan_text_for_leaks("clean <REDACTED_AWS_KEY> and <EMAIL_ab12cd> and 127.0.0.1")
+    clean = scan_text_for_leaks(
+        "clean <REDACTED_AWS_KEY> postgres://admin:<REDACTED_DB_PASS>@host/db "
+        "Bearer <REDACTED_BEARER_TOKEN> and <EMAIL_ab12cd> and 127.0.0.1"
+    )
     assert clean == {}
 
     good_row = {

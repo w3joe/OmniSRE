@@ -55,8 +55,16 @@ def scan_text_for_leaks(text: str) -> dict[str, int]:
     hits: dict[str, int] = {}
     for label, pat in SECRET_PATTERNS:
         matches = pat.findall(text)
-        if matches:
-            hits[label] = hits.get(label, 0) + len(matches)
+        if not matches:
+            continue
+        unredacted = 0
+        for m in matches:
+            blob = " ".join(m) if isinstance(m, tuple) else str(m)
+            if "<REDACTED_" in blob:
+                continue
+            unredacted += 1
+        if unredacted > 0:
+            hits[label] = hits.get(label, 0) + unredacted
 
     emails = EMAIL_RE.findall(text)
     if emails:
