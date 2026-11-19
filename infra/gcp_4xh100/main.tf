@@ -61,9 +61,9 @@ resource "google_compute_instance" "sre_rl_a3_4g" {
 
   boot_disk {
     initialize_params {
-      image = "projects/deeplearning-platform-release/global/images/family/pytorch-2-5-cu124-ubuntu-2204-nvidia-560"
+      image = "projects/deeplearning-platform-release/global/images/family/pytorch-2-9-cu129-ubuntu-2404-nvidia-580"
       size  = 250
-      type  = "pd-ssd"
+      type  = "pd-balanced"
     }
   }
 
