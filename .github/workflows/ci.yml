@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra dev
+      - name: Lint with Ruff
+        run: uv run ruff check src tests scripts
+      - name: Run Pytest suite
+        run: uv run pytest -v
+      - name: Smoke-test dataset pipeline & Pass^5 eval
+        run: |
+          uv run python scripts/build_datasets.py --output-dir /tmp/sre_ci_data --num-scenarios 60 --sft-trajectories 30
+          uv run python scripts/run_eval_pass_hat_k.py --scenarios /tmp/sre_ci_data/eval_heldout_scenarios.json --policy expert --k 5
