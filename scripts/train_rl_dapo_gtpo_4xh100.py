@@ -44,27 +44,44 @@ from sre_rl.rewards.verifiable_reward import score_episode
 from sre_rl.schemas import IncidentScenario
 
 
-def _compute_selected_logprobs(
-    logits: torch.Tensor,
+def _compute_masked_logprobs_with_logits_to_keep(
+    model,
     input_ids: torch.Tensor,
-    chunk_size: int = 512,
-) -> torch.Tensor:
-    """Compute per-token log-probabilities in 512-token chunks to avoid 248K-vocab OOM."""
-    seq_len = input_ids.shape[1]
-    if seq_len <= 1:
-        return torch.zeros(seq_len, device=input_ids.device, dtype=torch.float32)
+    action_mask: torch.Tensor,
+    chunk_size: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute log-probs ONLY at active assistant token positions using `logits_to_keep`.
 
-    chunks: list[torch.Tensor] = [
-        torch.zeros(1, device=input_ids.device, dtype=torch.float32)
-    ]
-    for start in range(0, seq_len - 1, chunk_size):
-        end = min(seq_len - 1, start + chunk_size)
+    Avoids materializing `[1, seq_len, 248320]` logits across 8K-token `<tool_response>`
+    context, saving >10 GB of H100 VRAM per GPU on 14-turn Qwen3.8-27B trajectories.
+
+    Returns `(active_logprobs, active_token_positions)` where `active_token_positions`
+    are the target indices `t >= 1` with `action_mask[t] > 0`.
+    """
+    active_target_pos = torch.nonzero(action_mask[1:] > 0.0, as_tuple=False).squeeze(-1) + 1
+    if active_target_pos.numel() == 0:
+        empty = torch.zeros(0, device=input_ids.device, dtype=torch.float32)
+        return empty, active_target_pos
+
+    # Predict token at position `t` using hidden state at `t - 1`
+    pred_positions = active_target_pos - 1
+    logits = model(
+        input_ids=input_ids,
+        use_cache=False,
+        logits_to_keep=pred_positions,
+    ).logits  # shape: [1, num_active, vocab_size]
+
+    num_active = active_target_pos.numel()
+    target_ids = input_ids[0, active_target_pos]
+    chunks: list[torch.Tensor] = []
+    for start in range(0, num_active, chunk_size):
+        end = min(num_active, start + chunk_size)
         sub_logits = logits[0, start:end, :].float()
-        sub_labels = input_ids[0, start + 1 : end + 1].unsqueeze(-1)
+        sub_labels = target_ids[start:end].unsqueeze(-1)
         sub_lp = torch.log_softmax(sub_logits, dim=-1)
-        gathered = torch.gather(sub_lp, dim=-1, index=sub_labels).squeeze(-1)
-        chunks.append(gathered)
-    return torch.cat(chunks, dim=0)
+        chunks.append(torch.gather(sub_lp, dim=-1, index=sub_labels).squeeze(-1))
+    del logits
+    return torch.cat(chunks, dim=0), active_target_pos
 
 
 def _chat_template_ids(
@@ -97,9 +114,9 @@ def rollout_batch_multi_turn(
     tokenizer,
     scenarios: list[IncidentScenario],
     device: torch.device,
-    max_turns: int = 14,
+    max_turns: int = 12,
     max_new_tokens_per_turn: int = 256,
-    max_seq_len: int = 10240,
+    max_seq_len: int = 7168,
     temperature: float = 0.85,
 ) -> list[tuple[list[int], RolloutGroupItem, dict[str, float]]]:
     """Run `len(scenarios)` multi-turn SRE episodes concurrently on one GPU via left-padded batching."""
@@ -459,34 +476,36 @@ def main() -> None:
                 input_ids = torch.tensor([seq_ids_list], dtype=torch.long, device=device)
                 adv_t = torch.tensor(adv_np, dtype=torch.float32, device=device)
                 mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
-                active_count = torch.clamp(mask_t.sum(), min=1.0)
 
                 with torch.no_grad():
-                    old_logits = peft_model(input_ids=input_ids, use_cache=False).logits
-                    old_lp = _compute_selected_logprobs(old_logits, input_ids)
-                    del old_logits
+                    old_lp, active_pos = _compute_masked_logprobs_with_logits_to_keep(
+                        peft_model, input_ids, mask_t
+                    )
+                    if active_pos.numel() == 0:
+                        continue
                     with peft_model.disable_adapter():
-                        ref_logits = peft_model(input_ids=input_ids, use_cache=False).logits
-                        ref_lp = _compute_selected_logprobs(ref_logits, input_ids)
-                        del ref_logits
+                        ref_lp, _ = _compute_masked_logprobs_with_logits_to_keep(
+                            peft_model, input_ids, mask_t
+                        )
                 torch.cuda.empty_cache()
 
-                new_logits = ddp_model(input_ids=input_ids, use_cache=False).logits
-                new_lp = _compute_selected_logprobs(new_logits, input_ids)
-                del new_logits
+                new_lp, _ = _compute_masked_logprobs_with_logits_to_keep(
+                    ddp_model, input_ids, mask_t
+                )
+                active_adv = adv_t[active_pos]
 
-                log_ratio = (new_lp - old_lp) * mask_t
+                log_ratio = new_lp - old_lp
                 ratio = torch.exp(torch.clamp(log_ratio, -15.0, 15.0))
                 clipped_ratio = torch.clamp(
                     ratio, 1.0 - dapo_cfg.clip_eps_low, 1.0 + dapo_cfg.clip_eps_high
                 )
-                surr = torch.minimum(ratio * adv_t, clipped_ratio * adv_t) * mask_t
-                policy_loss = -surr.sum() / active_count
+                surr = torch.minimum(ratio * active_adv, clipped_ratio * active_adv)
+                policy_loss = -surr.mean()
 
                 # Low-variance Schulman KL estimator anchored to Stage 1 SFT policy
-                log_ref_diff = torch.clamp((ref_lp - new_lp) * mask_t, -10.0, 10.0)
-                kl_per_tok = (torch.exp(log_ref_diff) - log_ref_diff - 1.0) * mask_t
-                kl_loss = args.kl_coef * (kl_per_tok.sum() / active_count)
+                log_ref_diff = torch.clamp(ref_lp - new_lp, -10.0, 10.0)
+                kl_per_tok = torch.exp(log_ref_diff) - log_ref_diff - 1.0
+                kl_loss = args.kl_coef * kl_per_tok.mean()
 
                 loss = (policy_loss + kl_loss) / denom
                 loss.backward()
