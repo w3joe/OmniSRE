@@ -102,42 +102,58 @@ tags:
 - omnisre
 ---
 
-# OmniSRE-27B ({stage_label})
+<p align="center">
+  <img src="assets/omnisre_hero.png" alt="OmniSRE-27B Hero Banner" width="100%"/>
+</p>
 
-**OmniSRE-27B** is an open-weights Site Reliability Engineering (SRE) agent model built so any
-engineering team can self-host autonomous incident triage, fault localization, root-cause analysis
-(RCA), and read-before-write remediation under the **Apache 2.0** license.
+<p align="center">
+  <a href="https://github.com/w3joe/qwen38-sre-rl"><img src="https://img.shields.io/badge/GitHub-Code%20%26%20RLVR%20Pipeline-181717?style=for-the-badge&logo=github" alt="GitHub"/></a>
+  <img src="https://img.shields.io/badge/License-Apache%202.0-10B981?style=for-the-badge" alt="Apache 2.0"/>
+  <img src="https://img.shields.io/badge/Release-{stage_label.replace('-', '--')}-38BDF8?style=for-the-badge" alt="Release"/>
+  <img src="https://img.shields.io/badge/Hardware-1x%20H100%20%2F%20L40S%20FP8-A78BFA?style=for-the-badge" alt="Hardware"/>
+</p>
 
-> **Status:** `{stage_label}` — {artifact_note}
+> **OmniSRE** is an open-weights Site Reliability Engineering agent built so any team can self-host autonomous incident triage, fault localization, RCA, and read-before-write remediation. {artifact_note}
 
-## Architecture & Post-Training Recipe
+---
 
-* **Base Model:** `{base_model}` (27B Dense 3:1 hybrid architecture: 48 Gated DeltaNet linear-attention layers + 16 Gated Attention layers, 262K native context, FP8 KV-cache footprint ~2 GB per 64K trace).
-* **Hybrid LoRA Targeting:** Rank-64 adapters applied across **both** Gated DeltaNet (`in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`, `out_proj`) and Gated Attention + SwiGLU MLP projections (`q/k/v/o_proj`, `gate/up/down_proj`), with the Vision Encoder and MTP heads frozen (`466.9M` trainable parameters / `1.68%`).
-* **RL Post-Training:** Multi-Turn **DAPO + GTPO** (Group Turn Policy Optimization) with:
-  * **Read-Before-Write Separation:** Hard guardrail requiring $\\ge 2$ diagnostic reads prior to any write mutation.
-  * **Verifiable Dual State + SLO Rewards:** Blind pod restarts on persistent config/code defects receive `0` mitigation credit; metastable retry storms require both config patching and capacity scale-out.
-  * **Anti-Stalling & Positive-Winner Filtering:** DAPO filters zero-variance and zero-winner groups (`max_reward < 0.50`) and penalizes read-only timeouts.
-  * **Adversarial Log Hygiene:** Trained to ignore prompt-injection payloads hidden inside untrusted HTTP/application logs and never mutate healthy services on benign false alarms.
+### Agent Architecture & Safety Guardrails
 
-## Open-Source Training Corpus (5-Gate Validated)
+<p align="center">
+  <img src="assets/omnisre_architecture.png" alt="OmniSRE Read-Write Separated Architecture" width="100%"/>
+</p>
 
-Trained on **5,038** scrubbed, deduplicated, 5-gate-validated SRE trajectories (`0` PII/secret leaks,
-`0` train/eval topology overlap) sourced from openly licensed community corpora:
-* `rmems/incident-response-oncall-trajectories` (Apache-2.0)
-* `openshift/runbooks` & `prometheus-operator/runbooks` (Apache-2.0)
-* `samber/awesome-prometheus-alerts` (1,217 production PromQL alert rules)
-* `SREGym/SREGym` (MIT)
-* `miyad316/sre-agentic-trajectories-devops`, `beatsprom/devops-kubernetes-iac-sft-dpo-2026` (CC-BY-4.0), `nolabs/deepfabric-devops-reasoning-traces`, `Snaseem2026/devops-incident-response`, and `danluu/post-mortems`.
+---
 
-{eval_section}## Quickstart
+### Training Dynamics *(4× NVIDIA H100)*
+
+<p align="center">
+  <img src="assets/omnisre_training_curves.png" alt="OmniSRE Training Loss and Accuracy Curves" width="100%"/>
+</p>
+
+{eval_section}---
+
+### Open-Source SRE Corpus & 5-Gate Validation
+
+<p align="center">
+  <img src="assets/omnisre_dataset_infographic.png" alt="OmniSRE Dataset Breakdown and 5-Gate Validation" width="100%"/>
+</p>
+
+---
+
+### Quickstart
 
 {usage_snippet}
 
-## Training Code & Reproducibility
+<details>
+<summary><b>Open-Source Corpus Credits & Training Specs</b></summary>
 
-Full open-source training pipeline, 5-gate dataset validator, Tier-1 snapshot simulator, and GCP `4x H100` scripts:
-[https://github.com/w3joe/qwen38-sre-rl](https://github.com/w3joe/qwen38-sre-rl)
+* **Base:** `{base_model}` (27B Dense 3:1 Hybrid Gated DeltaNet + Gated Attention, 262K native context)
+* **Adapter:** Rank-64 Hybrid LoRA (`466.9M` trainable params / `1.68%`; Vision Encoder & MTP frozen)
+* **Data Sources:** `rmems/incident-response-oncall-trajectories` (Apache-2.0), `openshift/runbooks` (Apache-2.0), `prometheus-operator/runbooks` (Apache-2.0), `samber/awesome-prometheus-alerts`, `SREGym/SREGym` (MIT), `miyad316/sre-agentic-trajectories-devops`, `beatsprom/devops-kubernetes-iac-sft-dpo-2026` (CC-BY-4.0), `nolabs/deepfabric-devops-reasoning-traces`, `Snaseem2026/devops-incident-response`, `danluu/post-mortems`.
+* **Pipeline Repo:** [github.com/w3joe/qwen38-sre-rl](https://github.com/w3joe/qwen38-sre-rl)
+
+</details>
 """
 
 
