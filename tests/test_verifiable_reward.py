@@ -42,6 +42,22 @@ def test_benign_false_alarm_penalizes_unnecessary_write_action() -> None:
     assert breakdown.total < 0.0
 
 
+def test_stalled_readonly_episode_receives_timeout_penalty() -> None:
+    tmpl = next(t for t in FAULT_TEMPLATES if t["fault_id"] == "k8s_oom_memory_limit")
+    scenario = generate_scenario(index=7, rng=random.Random(8), topology_name="otel-astronomy-shop", template=tmpl)
+
+    env = Tier1SnapshotEnvironment(max_turns=3)
+    env.reset(scenario)
+    env.step('<think>r1</think><tool_call>{"name": "query_metrics", "arguments": {}}</tool_call>')
+    env.step('<think>r2</think><tool_call>{"name": "search_logs", "arguments": {}}</tool_call>')
+    env.step('<think>r3</think><tool_call>{"name": "k8s_inspect", "arguments": {}}</tool_call>')
+    ep = env.finalize_episode()
+    breakdown = score_episode(scenario, ep)
+    assert breakdown.mitigated is False
+    assert breakdown.efficiency_penalty >= 0.25
+    assert breakdown.total < 0.0
+
+
 def test_overthinking_penalty_triggers_above_reasoning_effort_budget() -> None:
     tmpl = next(t for t in FAULT_TEMPLATES if t["fault_id"] == "benign_cron_metrics_blip")
     scenario = generate_scenario(index=6, rng=random.Random(4), topology_name="streaming-ingest-mesh", template=tmpl)

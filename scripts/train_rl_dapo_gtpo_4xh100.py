@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Standalone 4x H100 Multi-Turn DAPO + GTPO RLVR Trainer for `Qwen/Qwen3.8-27B` (Dense).
 
-Runs interactive multi-turn SRE rollouts across 4x H100 GPUs in parallel:
-- Each rank generates `rollouts_per_gpu` (default 2 -> `G = 4 * 2 = 8` group rollouts)
-  against `Tier1SnapshotEnvironment` with `preserve_thinking`.
-- Scores episodes via deterministic `score_episode` (Detection + Localization + RCA +
-  Dual State/SLO Mitigation - Safety/Overthinking Penalties).
-- Applies **DAPO Dynamic Zero-Variance Group Filtering** (`std < 1e-4` skipped).
-- Computes **GTPO Hybrid Turn + Outcome Advantages** strictly over assistant `<think>`
-  and `<tool_call>` tokens (`action_mask = 0` on system & `<tool_response>` tokens).
-- Computes reference policy log-probs with **zero extra VRAM** via `model.disable_adapter()`.
-- Updates Rank-64 Hybrid (Gated DeltaNet + Gated Attention + SwiGLU) LoRA weights using
-  DAPO asymmetric clipping (`[1 - 0.20, 1 + 0.28]`) + low-variance KL regularization.
+Run-v3 Anti-Stalling & Batched Multi-Prompt RLVR Architecture:
+- Shuffles real-world grounded RLVR scenarios across all topologies/alert families.
+- Generates `rollouts_per_gpu` rollouts **in parallel per GPU** via left-padded batched
+  `.generate()` (`G = 4 * rollouts_per_gpu = 8` rollouts per incident scenario).
+- Applies **DAPO Positive-Winner + Zero-Variance Filtering** (`std >= 1e-4` AND
+  `max_reward >= min_group_max_reward`) so zero-winner groups can NEVER reinforce
+  read-only timeout stalling over remediation attempts.
+- Computes **Completion-Gated GTPO Hybrid Turn + Outcome Advantages** strictly over
+  assistant `<think>` + `<tool_call>` tokens (`action_mask = 0` on env observations).
+- Accumulates gradients across `prompts_per_step` (default `4` -> `32` trajectories per
+  optimizer update) with 512-token chunked 248K-vocab log-probs (~0.5 GB peak logit VRAM)
+  and zero-extra-VRAM reference KL via `model.disable_adapter()`.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import time
 from pathlib import Path
 
@@ -42,7 +44,7 @@ from sre_rl.rewards.verifiable_reward import score_episode
 from sre_rl.schemas import IncidentScenario
 
 
-def _compute_Selected_logprobs(
+def _compute_selected_logprobs(
     logits: torch.Tensor,
     input_ids: torch.Tensor,
     chunk_size: int = 512,
@@ -90,123 +92,172 @@ def _chat_template_ids(
 
 
 @torch.no_grad()
-def rollout_multi_turn_episode(
+def rollout_batch_multi_turn(
     unwrapped_model,
     tokenizer,
-    scenario: IncidentScenario,
+    scenarios: list[IncidentScenario],
     device: torch.device,
-    max_turns: int = 8,
+    max_turns: int = 14,
     max_new_tokens_per_turn: int = 256,
-    max_seq_len: int = 8192,
-    temperature: float = 0.9,
-) -> tuple[list[int], RolloutGroupItem, dict[str, float]]:
-    """Run one interactive multi-turn SRE episode and track exact assistant token spans."""
+    max_seq_len: int = 10240,
+    temperature: float = 0.85,
+) -> list[tuple[list[int], RolloutGroupItem, dict[str, float]]]:
+    """Run `len(scenarios)` multi-turn SRE episodes concurrently on one GPU via left-padded batching."""
     unwrapped_model.eval()
-    env = Tier1SnapshotEnvironment(max_turns=max_turns, max_output_chars=3000)
-    initial_alert = env.reset(scenario)
+    bsz = len(scenarios)
+    envs = [Tier1SnapshotEnvironment(max_turns=max_turns, max_output_chars=2800) for _ in range(bsz)]
+    messages_list: list[list[dict[str, str]]] = []
+    full_ids_list: list[list[int]] = []
+    turn_spans_list: list[list[tuple[int, int]]] = [[] for _ in range(bsz)]
+    turn_rewards_list: list[list[float]] = [[] for _ in range(bsz)]
+    done_flags = [False] * bsz
 
-    messages = [
-        {"role": "system", "content": build_sre_system_prompt(scenario.reasoning_effort)},
-        {"role": "user", "content": initial_alert},
-    ]
+    for i, sc in enumerate(scenarios):
+        alert = envs[i].reset(sc)
+        msgs = [
+            {"role": "system", "content": build_sre_system_prompt(sc.reasoning_effort)},
+            {"role": "user", "content": alert},
+        ]
+        messages_list.append(msgs)
+        full_ids_list.append(_chat_template_ids(tokenizer, msgs, add_generation_prompt=False))
 
-    full_ids: list[int] = _chat_template_ids(
-        tokenizer, messages, add_generation_prompt=False
-    )
-    turn_spans: list[tuple[int, int]] = []
-    turn_rewards: list[float] = []
+    pad_id = int(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id)
+    eos_id = int(tokenizer.eos_token_id)
 
     for _ in range(max_turns):
-        formatted_msgs = format_multiturn_preserve_thinking(messages, preserve_thinking=True)
-        prompt_ids: list[int] = _chat_template_ids(
-            tokenizer, formatted_msgs, add_generation_prompt=True
-        )
-        if len(prompt_ids) >= max_seq_len - max_new_tokens_per_turn:
+        active_indices: list[int] = []
+        active_prompts: list[list[int]] = []
+        for i in range(bsz):
+            if done_flags[i]:
+                continue
+            fmt_msgs = format_multiturn_preserve_thinking(messages_list[i], preserve_thinking=True)
+            p_ids = _chat_template_ids(tokenizer, fmt_msgs, add_generation_prompt=True)
+            if len(p_ids) >= max_seq_len - max_new_tokens_per_turn:
+                done_flags[i] = True
+                continue
+            active_indices.append(i)
+            active_prompts.append(p_ids)
+
+        if not active_indices:
             break
 
-        inp = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-        attn_mask = torch.ones_like(inp)
+        # Left-pad active prompts for batched autoregressive decode
+        max_p = max(len(p) for p in active_prompts)
+        padded_inp = torch.full((len(active_indices), max_p), pad_id, dtype=torch.long, device=device)
+        attn_mask = torch.zeros((len(active_indices), max_p), dtype=torch.long, device=device)
+        for row_i, p_ids in enumerate(active_prompts):
+            offset = max_p - len(p_ids)
+            padded_inp[row_i, offset:] = torch.tensor(p_ids, dtype=torch.long, device=device)
+            attn_mask[row_i, offset:] = 1
+
         gen_out = unwrapped_model.generate(
-            input_ids=inp,
+            input_ids=padded_inp,
             attention_mask=attn_mask,
             max_new_tokens=max_new_tokens_per_turn,
             do_sample=(temperature > 0.0),
             temperature=temperature if temperature > 0.0 else None,
             top_p=0.95 if temperature > 0.0 else None,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=pad_id,
+            eos_token_id=eos_id,
             use_cache=True,
         )
-        gen_tokens = gen_out[0, len(prompt_ids) :].tolist()
-        if not gen_tokens:
-            break
 
-        assistant_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
-        outcome = env.step(assistant_text)
+        for row_i, idx in enumerate(active_indices):
+            raw_gen = gen_out[row_i, max_p:].tolist()
+            # Trim any trailing pad/eos beyond the first EOS token
+            gen_tokens: list[int] = []
+            for tok in raw_gen:
+                if tok == pad_id and gen_tokens:
+                    break
+                gen_tokens.append(int(tok))
+                if tok == eos_id:
+                    break
 
-        # Track exact assistant token span inside concatenated rollout sequence
-        start_idx = len(prompt_ids)
-        full_ids = prompt_ids + gen_tokens
-        end_idx = len(full_ids)
-        turn_spans.append((start_idx, end_idx))
-        turn_rewards.append(float(outcome.step_shaping_reward))
+            if not gen_tokens:
+                done_flags[idx] = True
+                continue
 
-        messages.append({"role": "assistant", "content": assistant_text})
-        messages.append(
-            {"role": "user", "content": f"<tool_response>\n{outcome.observation}\n</tool_response>"}
+            assistant_text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
+            outcome = envs[idx].step(assistant_text)
+
+            p_ids = active_prompts[row_i]
+            start_pos = len(p_ids)
+            full_ids_list[idx] = p_ids + gen_tokens
+            end_pos = len(full_ids_list[idx])
+            turn_spans_list[idx].append((start_pos, end_pos))
+            turn_rewards_list[idx].append(float(outcome.step_shaping_reward))
+
+            messages_list[idx].append({"role": "assistant", "content": assistant_text})
+            messages_list[idx].append(
+                {
+                    "role": "user",
+                    "content": f"<tool_response>\n{outcome.observation}\n</tool_response>",
+                }
+            )
+            if outcome.done:
+                done_flags[idx] = True
+
+    results: list[tuple[list[int], RolloutGroupItem, dict[str, float]]] = []
+    for i, sc in enumerate(scenarios):
+        ep = envs[i].finalize_episode()
+        breakdown = score_episode(sc, ep)
+        item = RolloutGroupItem(
+            outcome_reward=float(breakdown.total),
+            turn_rewards=turn_rewards_list[i],
+            turn_token_spans=turn_spans_list[i],
+            total_seq_len=len(full_ids_list[i]),
         )
-        if outcome.done:
-            break
+        stats = {
+            "reward": float(breakdown.total),
+            "mitigated": float(breakdown.mitigated),
+            "safety_violated": float(breakdown.safety_violated),
+            "turns": float(len(turn_spans_list[i])),
+        }
+        results.append((full_ids_list[i], item, stats))
+    return results
 
-    ep = env.finalize_episode()
-    breakdown = score_episode(scenario, ep)
-    group_item = RolloutGroupItem(
-        outcome_reward=float(breakdown.total),
-        turn_rewards=turn_rewards,
-        turn_token_spans=turn_spans,
-        total_seq_len=len(full_ids),
-    )
-    stats = {
-        "reward": float(breakdown.total),
-        "mitigated": float(breakdown.mitigated),
-        "safety_violated": float(breakdown.safety_violated),
-        "turns": float(len(turn_spans)),
-    }
-    return full_ids, group_item, stats
+
+def _load_verl_jsonl_scenarios(path: Path) -> list[IncidentScenario]:
+    loaded: list[IncidentScenario] = []
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        if not ln.strip():
+            continue
+        row = json.loads(ln)
+        gt = row["reward_model"]["ground_truth"]
+        sc = (
+            IncidentScenario.model_validate_json(gt)
+            if isinstance(gt, str)
+            else IncidentScenario.model_validate(gt)
+        )
+        loaded.append(sc)
+    return loaded
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="4x H100 Multi-Turn DAPO + GTPO RLVR Trainer")
+    parser = argparse.ArgumentParser(description="4x H100 Batched Multi-Turn DAPO + GTPO RLVR Trainer")
     parser.add_argument("--model-id", type=str, default="Qwen/Qwen3.8-27B")
     parser.add_argument(
         "--sft-adapter-dir",
         type=Path,
-        default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-sft-lora64"),
+        default=Path("/mnt/nvme/checkpoints_v2/sft-lora64"),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-rl-dapo-gtpo"),
+        default=Path("/mnt/nvme/checkpoints_v3/rl-dapo-gtpo"),
     )
-    parser.add_argument(
-        "--train-scenarios-jsonl",
-        type=Path,
-        default=None,
-        help="Optional veRL JSONL file (e.g. rl_real_train.jsonl) with serialized IncidentScenario ground_truth.",
-    )
-    parser.add_argument(
-        "--heldout-scenarios-jsonl",
-        type=Path,
-        default=None,
-        help="Optional veRL JSONL file (e.g. rl_real_heldout.jsonl) for before/after held-out eval.",
-    )
+    parser.add_argument("--train-scenarios-jsonl", type=Path, default=None)
+    parser.add_argument("--heldout-scenarios-jsonl", type=Path, default=None)
     parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--max-scenario-attempts", type=int, default=60)
-    parser.add_argument("--eval-heldout-count", type=int, default=12)
+    parser.add_argument("--prompts-per-step", type=int, default=4)
+    parser.add_argument("--max-scenario-attempts", type=int, default=160)
+    parser.add_argument("--eval-heldout-count", type=int, default=24)
     parser.add_argument("--rollouts-per-gpu", type=int, default=2)
-    parser.add_argument("--max-turns", type=int, default=8)
-    parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--kl-coef", type=float, default=0.01)
+    parser.add_argument("--max-turns", type=int, default=14)
+    parser.add_argument("--min-group-max-reward", type=float, default=0.50)
+    parser.add_argument("--lr", type=float, default=2e-6)
+    parser.add_argument("--kl-coef", type=float, default=0.04)
+    parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -236,7 +287,7 @@ def main() -> None:
 
     if args.sft_adapter_dir.exists() and (args.sft_adapter_dir / "adapter_config.json").exists():
         if local_rank == 0:
-            print(f"[rlvr] Initializing policy from SFT LoRA adapter: {args.sft_adapter_dir}")
+            print(f"[rlvr] Initializing policy from SFT LoRA adapter: {args.sft_adapter_dir}", flush=True)
         peft_model = PeftModel.from_pretrained(
             base_model, str(args.sft_adapter_dir), is_trainable=True
         )
@@ -255,56 +306,51 @@ def main() -> None:
         weight_decay=0.01,
     )
 
-    def _load_verl_jsonl_scenarios(path: Path) -> list[IncidentScenario]:
-        loaded: list[IncidentScenario] = []
-        for ln in path.read_text(encoding="utf-8").splitlines():
-            if not ln.strip():
-                continue
-            row = json.loads(ln)
-            gt = row["reward_model"]["ground_truth"]
-            sc = (
-                IncidentScenario.model_validate_json(gt)
-                if isinstance(gt, str)
-                else IncidentScenario.model_validate(gt)
-            )
-            loaded.append(sc)
-        return loaded
-
     if args.train_scenarios_jsonl is not None and args.train_scenarios_jsonl.exists():
         scenarios = _load_verl_jsonl_scenarios(args.train_scenarios_jsonl)
         if args.heldout_scenarios_jsonl is not None and args.heldout_scenarios_jsonl.exists():
-            heldout_eval_scenarios = _load_verl_jsonl_scenarios(args.heldout_scenarios_jsonl)[
-                : args.eval_heldout_count
-            ]
+            heldout_pool = _load_verl_jsonl_scenarios(args.heldout_scenarios_jsonl)
         else:
-            heldout_eval_scenarios = scenarios[-args.eval_heldout_count :]
-        if local_rank == 0:
-            print(
-                f"[rlvr] Loaded {len(scenarios)} train & {len(heldout_eval_scenarios)} held-out "
-                f"real grounded RLVR scenarios from {args.train_scenarios_jsonl}",
-                flush=True,
-            )
+            heldout_pool = list(scenarios[-args.eval_heldout_count :])
     else:
         splits = split_scenarios_decontaminated(
             generate_scenario_suite(num_scenarios=400, seed=args.seed)
         )
         scenarios = splits.train
-        heldout_eval_scenarios = splits.eval_heldout[: args.eval_heldout_count]
+        heldout_pool = splits.eval_heldout
+
+    # CRITICAL FIX #1: Deterministically shuffle BOTH train and held-out pools across all ranks
+    # so training never sees consecutive single-component alerts (e.g. 8x OVN in a row).
+    random.Random(args.seed).shuffle(scenarios)
+    random.Random(args.seed + 7).shuffle(heldout_pool)
+    heldout_eval_scenarios = heldout_pool[: args.eval_heldout_count]
+
+    if local_rank == 0:
+        print(
+            f"[rlvr] Shuffled {len(scenarios)} train & {len(heldout_eval_scenarios)} held-out scenarios "
+            f"(max_turns={args.max_turns}, prompts_per_step={args.prompts_per_step}, "
+            f"min_group_max_reward={args.min_group_max_reward})",
+            flush=True,
+        )
 
     def _run_distributed_heldout_eval(label: str) -> dict[str, float]:
-        local_eval_stats = []
-        for idx, sc in enumerate(heldout_eval_scenarios):
-            if idx % world_size != local_rank:
-                continue
-            _, _, st = rollout_multi_turn_episode(
+        my_scenarios = [
+            sc for idx, sc in enumerate(heldout_eval_scenarios) if idx % world_size == local_rank
+        ]
+        local_eval_stats: list[dict[str, float]] = []
+        # Evaluate in mini-batches of 2 per GPU concurrently for ~2x eval speedup
+        for start in range(0, len(my_scenarios), 2):
+            batch_sc = my_scenarios[start : start + 2]
+            batch_out = rollout_batch_multi_turn(
                 unwrapped_model=peft_model,
                 tokenizer=tokenizer,
-                scenario=sc,
+                scenarios=batch_sc,
                 device=device,
                 max_turns=args.max_turns,
                 temperature=0.0,
             )
-            local_eval_stats.append(st)
+            local_eval_stats.extend(st for _, _, st in batch_out)
+
         all_eval_lists: list[list[dict[str, float]]] = [None] * world_size  # type: ignore[list-item]
         dist.all_gather_object(all_eval_lists, local_eval_stats)
         flat = [x for sub in all_eval_lists for x in sub]
@@ -326,132 +372,169 @@ def main() -> None:
         clip_eps_high=0.28,
         gamma=0.92,
         outcome_dampening_lambda=0.30,
+        min_group_max_reward=args.min_group_max_reward,
+        gate_positive_shaping_on_success=True,
     )
 
     before_eval = _run_distributed_heldout_eval("before_rl_sft_checkpoint")
 
     completed_updates = 0
     filtered_zero_var = 0
+    filtered_zero_winner = 0
     scenario_cursor = 0
 
     while completed_updates < args.steps and scenario_cursor < args.max_scenario_attempts:
-        t0 = time.time()
-        scenario = scenarios[scenario_cursor % len(scenarios)]
-        scenario_cursor += 1
-
-        # 1. Parallel Group Rollout across all 4x H100 GPUs (G = world_size * rollouts_per_gpu)
-        local_traces: list[tuple[list[int], RolloutGroupItem, dict[str, float]]] = []
-        for _ in range(args.rollouts_per_gpu):
-            trace = rollout_multi_turn_episode(
-                unwrapped_model=peft_model,
-                tokenizer=tokenizer,
-                scenario=scenario,
-                device=device,
-                max_turns=args.max_turns,
-            )
-            local_traces.append(trace)
-
-        gathered_items: list[list[RolloutGroupItem]] = [None] * world_size  # type: ignore[list-item]
-        gathered_stats: list[list[dict[str, float]]] = [None] * world_size  # type: ignore[list-item]
-        dist.all_gather_object(gathered_items, [t[1] for t in local_traces])
-        dist.all_gather_object(gathered_stats, [t[2] for t in local_traces])
-
-        flat_group_items = [item for rank_items in gathered_items for item in rank_items]
-        flat_stats = [st for rank_stats in gathered_stats for st in rank_stats]
-        group_rewards = np.array([it.outcome_reward for it in flat_group_items], dtype=np.float64)
-
-        # 2. DAPO Dynamic Zero-Variance Group Filtering
-        if float(np.std(group_rewards)) < dapo_cfg.min_group_std:
-            filtered_zero_var += 1
-            if local_rank == 0:
-                print(
-                    f"[dapo-filter] Skipped zero-variance group on {scenario.scenario_id} "
-                    f"(uniform reward={group_rewards[0]:.3f}, total_filtered={filtered_zero_var})"
-                )
-            continue
-
-        # 3. GTPO Hybrid Turn + Outcome Advantage Calculation
-        all_advs, all_masks = compute_gtpo_hybrid_advantages(flat_group_items, config=dapo_cfg)
-        my_offset = local_rank * args.rollouts_per_gpu
-
-        # 4. Compute Reference & Old Log-Probs + DAPO Asymmetric Clipped Policy Gradient Update
+        step_t0 = time.time()
         ddp_model.train()
         optimizer.zero_grad()
-        total_loss_val = 0.0
 
-        for r_idx in range(args.rollouts_per_gpu):
-            seq_ids_list = local_traces[r_idx][0]
-            adv_np = all_advs[my_offset + r_idx]
-            mask_np = all_masks[my_offset + r_idx]
+        accepted_prompts = 0
+        step_loss_accum = 0.0
+        step_rewards_all: list[float] = []
+        step_mitigations_all: list[float] = []
+        step_safety_all: list[float] = []
+        step_turns_all: list[float] = []
+        step_scenarios_used: list[str] = []
 
-            input_ids = torch.tensor([seq_ids_list], dtype=torch.long, device=device)
-            adv_t = torch.tensor(adv_np, dtype=torch.float32, device=device)
-            mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
-            active_count = torch.clamp(mask_t.sum(), min=1.0)
+        while (
+            accepted_prompts < args.prompts_per_step
+            and scenario_cursor < args.max_scenario_attempts
+        ):
+            scenario = scenarios[scenario_cursor % len(scenarios)]
+            scenario_cursor += 1
 
-            with torch.no_grad():
-                old_logits = peft_model(input_ids=input_ids, use_cache=False).logits
-                old_lp = _compute_Selected_logprobs(old_logits, input_ids)
-                del old_logits
-                with peft_model.disable_adapter():
-                    ref_logits = peft_model(input_ids=input_ids, use_cache=False).logits
-                    ref_lp = _compute_Selected_logprobs(ref_logits, input_ids)
-                    del ref_logits
-            torch.cuda.empty_cache()
-
-            new_logits = ddp_model(input_ids=input_ids, use_cache=False).logits
-            new_lp = _compute_Selected_logprobs(new_logits, input_ids)
-            del new_logits
-
-            log_ratio = (new_lp - old_lp) * mask_t
-            ratio = torch.exp(torch.clamp(log_ratio, -15.0, 15.0))
-            clipped_ratio = torch.clamp(
-                ratio, 1.0 - dapo_cfg.clip_eps_low, 1.0 + dapo_cfg.clip_eps_high
+            # Batched parallel rollout generation on each GPU (G = 4 * rollouts_per_gpu = 8)
+            local_traces = rollout_batch_multi_turn(
+                unwrapped_model=peft_model,
+                tokenizer=tokenizer,
+                scenarios=[scenario] * args.rollouts_per_gpu,
+                device=device,
+                max_turns=args.max_turns,
+                temperature=0.85,
             )
-            surr = torch.minimum(ratio * adv_t, clipped_ratio * adv_t) * mask_t
-            policy_loss = -surr.sum() / active_count
 
-            # Low-variance Schulman KL estimator: exp(ref - new) - (ref - new) - 1
-            log_ref_diff = torch.clamp((ref_lp - new_lp) * mask_t, -10.0, 10.0)
-            kl_per_tok = (torch.exp(log_ref_diff) - log_ref_diff - 1.0) * mask_t
-            kl_loss = args.kl_coef * (kl_per_tok.sum() / active_count)
+            gathered_items: list[list[RolloutGroupItem]] = [None] * world_size  # type: ignore[list-item]
+            gathered_stats: list[list[dict[str, float]]] = [None] * world_size  # type: ignore[list-item]
+            dist.all_gather_object(gathered_items, [t[1] for t in local_traces])
+            dist.all_gather_object(gathered_stats, [t[2] for t in local_traces])
 
-            loss = (policy_loss + kl_loss) / args.rollouts_per_gpu
-            loss.backward()
-            total_loss_val += float(loss.detach().cpu())
-            del loss, policy_loss, kl_loss, new_lp, old_lp, ref_lp
-            torch.cuda.empty_cache()
+            flat_group_items = [item for rank_items in gathered_items for item in rank_items]
+            flat_stats = [st for rank_stats in gathered_stats for st in rank_stats]
+            group_rewards = np.array([it.outcome_reward for it in flat_group_items], dtype=np.float64)
+            group_std = float(np.std(group_rewards))
+            group_max = float(np.max(group_rewards))
+
+            # CRITICAL FIX #2: DAPO Zero-Variance AND Positive-Winner Filtering
+            if group_std < dapo_cfg.min_group_std:
+                filtered_zero_var += 1
+                if local_rank == 0:
+                    print(
+                        f"[dapo-filter] Skipped zero-variance group on {scenario.scenario_id} "
+                        f"(reward={group_rewards[0]:.3f})",
+                        flush=True,
+                    )
+                continue
+
+            if group_max < dapo_cfg.min_group_max_reward:
+                filtered_zero_winner += 1
+                if local_rank == 0:
+                    print(
+                        f"[dapo-filter] Skipped zero-winner group on {scenario.scenario_id} "
+                        f"(max_reward={group_max:.3f} < {dapo_cfg.min_group_max_reward:.2f}) — preventing stall reinforcement",
+                        flush=True,
+                    )
+                continue
+
+            # CRITICAL FIX #3: Completion-Gated GTPO Hybrid Advantages
+            all_advs, all_masks = compute_gtpo_hybrid_advantages(flat_group_items, config=dapo_cfg)
+            my_offset = local_rank * args.rollouts_per_gpu
+            denom = float(args.prompts_per_step * args.rollouts_per_gpu)
+
+            ddp_model.train()
+            for r_idx in range(args.rollouts_per_gpu):
+                seq_ids_list = local_traces[r_idx][0]
+                adv_np = all_advs[my_offset + r_idx]
+                mask_np = all_masks[my_offset + r_idx]
+
+                input_ids = torch.tensor([seq_ids_list], dtype=torch.long, device=device)
+                adv_t = torch.tensor(adv_np, dtype=torch.float32, device=device)
+                mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
+                active_count = torch.clamp(mask_t.sum(), min=1.0)
+
+                with torch.no_grad():
+                    old_logits = peft_model(input_ids=input_ids, use_cache=False).logits
+                    old_lp = _compute_selected_logprobs(old_logits, input_ids)
+                    del old_logits
+                    with peft_model.disable_adapter():
+                        ref_logits = peft_model(input_ids=input_ids, use_cache=False).logits
+                        ref_lp = _compute_selected_logprobs(ref_logits, input_ids)
+                        del ref_logits
+                torch.cuda.empty_cache()
+
+                new_logits = ddp_model(input_ids=input_ids, use_cache=False).logits
+                new_lp = _compute_selected_logprobs(new_logits, input_ids)
+                del new_logits
+
+                log_ratio = (new_lp - old_lp) * mask_t
+                ratio = torch.exp(torch.clamp(log_ratio, -15.0, 15.0))
+                clipped_ratio = torch.clamp(
+                    ratio, 1.0 - dapo_cfg.clip_eps_low, 1.0 + dapo_cfg.clip_eps_high
+                )
+                surr = torch.minimum(ratio * adv_t, clipped_ratio * adv_t) * mask_t
+                policy_loss = -surr.sum() / active_count
+
+                # Low-variance Schulman KL estimator anchored to Stage 1 SFT policy
+                log_ref_diff = torch.clamp((ref_lp - new_lp) * mask_t, -10.0, 10.0)
+                kl_per_tok = (torch.exp(log_ref_diff) - log_ref_diff - 1.0) * mask_t
+                kl_loss = args.kl_coef * (kl_per_tok.sum() / active_count)
+
+                loss = (policy_loss + kl_loss) / denom
+                loss.backward()
+                step_loss_accum += float(loss.detach().cpu())
+                del loss, policy_loss, kl_loss, new_lp, old_lp, ref_lp
+                torch.cuda.empty_cache()
+
+            accepted_prompts += 1
+            step_rewards_all.extend(group_rewards.tolist())
+            step_mitigations_all.extend(s["mitigated"] for s in flat_stats)
+            step_safety_all.extend(s["safety_violated"] for s in flat_stats)
+            step_turns_all.extend(s["turns"] for s in flat_stats)
+            step_scenarios_used.append(scenario.scenario_id)
+
+        if accepted_prompts == 0:
+            break
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0))
         optimizer.step()
         completed_updates += 1
 
         if local_rank == 0:
-            mean_r = float(np.mean(group_rewards))
-            max_r = float(np.max(group_rewards))
-            mit_rate = float(np.mean([s["mitigated"] for s in flat_stats]))
-            avg_turns = float(np.mean([s["turns"] for s in flat_stats]))
-            dt = time.time() - t0
+            dt = time.time() - step_t0
             print(
                 json.dumps(
                     {
                         "rl_step": completed_updates,
-                        "scenario": scenario.scenario_id,
-                        "loss": round(total_loss_val, 4),
+                        "prompts_in_batch": accepted_prompts,
+                        "loss": round(step_loss_accum, 4),
                         "grad_norm": round(grad_norm, 3),
-                        "group_mean_reward": round(mean_r, 4),
-                        "group_max_reward": round(max_r, 4),
-                        "group_std_reward": round(float(np.std(group_rewards)), 4),
-                        "mitigation_rate": round(mit_rate, 3),
-                        "avg_turns": round(avg_turns, 2),
-                        "filtered_groups": filtered_zero_var,
+                        "batch_mean_reward": round(float(np.mean(step_rewards_all)), 4),
+                        "batch_max_reward": round(float(np.max(step_rewards_all)), 4),
+                        "mitigation_rate": round(float(np.mean(step_mitigations_all)), 3),
+                        "safety_violation_rate": round(float(np.mean(step_safety_all)), 3),
+                        "avg_turns": round(float(np.mean(step_turns_all)), 2),
+                        "filtered_zero_var": filtered_zero_var,
+                        "filtered_zero_winner": filtered_zero_winner,
                         "step_time_s": round(dt, 1),
                     }
                 ),
                 flush=True,
             )
+            if args.save_every > 0 and completed_updates % args.save_every == 0:
+                ckpt_dir = args.output_dir / f"step-{completed_updates:03d}"
+                ckpt_dir.mkdir(parents=True, exist_ok=True)
+                peft_model.save_pretrained(ckpt_dir)
 
-    after_eval = _run_distributed_heldout_eval("after_rl_dapo_gtpo")
+    after_eval = _run_distributed_heldout_eval("after_rl_dapo_gtpo_v3")
 
     if local_rank == 0:
         args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -461,7 +544,10 @@ def main() -> None:
             json.dumps(
                 {
                     "completed_rl_updates": completed_updates,
+                    "prompts_per_step": args.prompts_per_step,
+                    "max_turns": args.max_turns,
                     "filtered_zero_var_groups": filtered_zero_var,
+                    "filtered_zero_winner_groups": filtered_zero_winner,
                     "before_rl": before_eval,
                     "after_rl": after_eval,
                 },
@@ -469,7 +555,7 @@ def main() -> None:
             ),
             encoding="utf-8",
         )
-        print(f"[rlvr] Saved post-trained Qwen3.8-27B SRE LoRA adapter to {args.output_dir}")
+        print(f"[rlvr] Saved Run-v3 post-trained Qwen3.8-27B SRE LoRA adapter to {args.output_dir}", flush=True)
 
     dist.destroy_process_group()
 

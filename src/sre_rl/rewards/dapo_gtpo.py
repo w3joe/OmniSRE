@@ -26,6 +26,8 @@ class DAPOConfig:
     gamma: float = 0.92
     outcome_dampening_lambda: float = 0.30
     min_group_std: float = 1e-4
+    min_group_max_reward: float = 0.50
+    gate_positive_shaping_on_success: bool = True
     norm_eps: float = 1e-6
 
 
@@ -40,17 +42,21 @@ class RolloutGroupItem:
 def filter_zero_variance_groups(
     group_outcome_rewards: np.ndarray,
     min_std: float = 1e-4,
+    min_max_reward: float | None = None,
 ) -> np.ndarray:
-    """Return boolean mask of shape `(num_prompts,)` keeping groups with non-zero variance.
+    """Return boolean mask of shape `(num_prompts,)` keeping informative groups.
 
-    Args:
-        group_outcome_rewards: Array of shape `(num_prompts, group_size)`.
-        min_std: Minimum group reward standard deviation to retain.
+    Excludes uniform zero-variance groups (`std <= min_std`) and, when `min_max_reward`
+    is set (e.g. `0.50`), also excludes zero-winner groups where every rollout failed so
+    DAPO cannot reinforce read-only timeout stalling over failed write attempts.
     """
     if group_outcome_rewards.ndim != 2:
         raise ValueError("`group_outcome_rewards` must have shape (num_prompts, group_size).")
     stds = np.std(group_outcome_rewards, axis=1)
-    return stds > min_std
+    keep = stds > min_std
+    if min_max_reward is not None:
+        keep = keep & (np.max(group_outcome_rewards, axis=1) >= min_max_reward)
+    return keep
 
 
 def build_assistant_action_mask(
@@ -106,8 +112,15 @@ def compute_gtpo_hybrid_advantages(
             )
         returns_k = np.zeros(num_turns, dtype=np.float64)
         running = item.outcome_reward
+        allow_pos_shaping = (
+            not cfg.gate_positive_shaping_on_success
+            or item.outcome_reward >= cfg.min_group_max_reward
+        )
         for k in range(num_turns - 1, -1, -1):
-            running = item.turn_rewards[k] + cfg.gamma * running
+            r_k = item.turn_rewards[k]
+            if not allow_pos_shaping and r_k > 0.0:
+                r_k = 0.0
+            running = r_k + cfg.gamma * running
             returns_k[k] = running
         per_rollout_returns.append(returns_k)
         all_turn_returns.extend(returns_k.tolist())

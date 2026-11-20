@@ -12,17 +12,21 @@ from sre_rl.rewards.dapo_gtpo import (
 )
 
 
-def test_dapo_filters_all_pass_and_all_fail_zero_variance_groups() -> None:
+def test_dapo_filters_zero_variance_and_zero_winner_groups() -> None:
     rewards = np.array(
         [
-            [0.0, 0.0, 0.0, 0.0],     # all fail -> drop
-            [1.0, 1.0, 1.0, 1.0],     # all pass -> drop
-            [-1.0, 0.2, 0.9, 1.0],    # informative variance -> keep
+            [0.0, 0.0, 0.0, 0.0],       # all fail -> drop
+            [1.0, 1.0, 1.0, 1.0],       # all pass -> drop
+            [-1.0, -0.2, 0.03, 0.12],   # variance exists, but 0 winners -> drop with min_max_reward=0.5!
+            [-1.0, 0.2, 0.9, 1.0],      # informative variance + real winners -> keep
         ],
         dtype=np.float64,
     )
-    keep = filter_zero_variance_groups(rewards)
-    assert keep.tolist() == [False, False, True]
+    keep_var_only = filter_zero_variance_groups(rewards)
+    assert keep_var_only.tolist() == [False, False, True, True]
+
+    keep_with_winner = filter_zero_variance_groups(rewards, min_max_reward=0.50)
+    assert keep_with_winner.tolist() == [False, False, False, True]
 
 
 def test_gtpo_hybrid_advantage_masks_env_tokens_and_credits_good_early_turns() -> None:

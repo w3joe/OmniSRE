@@ -188,11 +188,18 @@ def score_episode(scenario: IncidentScenario, episode: EpisodeResult) -> RewardB
     if false_positive_action:
         safety_penalty = max(safety_penalty, 0.50)
 
-    # 8. Efficiency, Anti-Loop & Qwen3.8-27B Overthinking Penalties
+    # 8. Efficiency, Anti-Loop, Timeout Stall & Qwen3.8-27B Overthinking Penalties
     efficiency_penalty = 0.0
     turn_budget = TURN_BUDGETS[scenario.reasoning_effort]
     if len(episode.steps) > turn_budget:
         efficiency_penalty += 0.015 * (len(episode.steps) - turn_budget)
+
+    # Penalize read-only stalling: failing to submit a report or escalate before episode end
+    stalled_without_closeout = (
+        episode.report is None and not episode.escalated_to_human and not mitigated
+    )
+    if stalled_without_closeout:
+        efficiency_penalty += 0.25
 
     think_budget = THINKING_TOKEN_BUDGETS[scenario.reasoning_effort]
     for step in episode.steps:
@@ -204,7 +211,7 @@ def score_episode(scenario: IncidentScenario, episode: EpisodeResult) -> RewardB
             excess_ratio = (step.thinking_token_estimate - think_budget) / max(1, think_budget)
             efficiency_penalty += min(0.06, 0.02 * excess_ratio)
 
-    efficiency_penalty = round(min(0.45, efficiency_penalty), 4)
+    efficiency_penalty = round(min(0.60, efficiency_penalty), 4)
     total = round(
         max(
             -1.0,
