@@ -306,16 +306,21 @@ def main() -> None:
 
     if args.sft_adapter_dir.exists() and (args.sft_adapter_dir / "adapter_config.json").exists():
         if local_rank == 0:
-            print(f"[rlvr] Initializing policy from SFT LoRA adapter: {args.sft_adapter_dir}", flush=True)
-        peft_model = PeftModel.from_pretrained(
-            base_model, str(args.sft_adapter_dir), is_trainable=True
-        )
-    else:
-        module_pairs = [(n, type(m).__name__) for n, m in base_model.named_modules()]
-        targets = discover_qwen38_lora_targets(module_pairs, require_deltanet=True)
-        peft_kwargs = build_qwen38_peft_lora_kwargs(spec)
-        peft_kwargs["target_modules"] = targets
-        peft_model = get_peft_model(base_model, LoraConfig(**peft_kwargs))
+            print(
+                f"[rlvr] Merging SFT adapter {args.sft_adapter_dir} into base weights so "
+                "disable_adapter() anchors KL strictly to pi_SFT (not raw base model)!",
+                flush=True,
+            )
+        sft_peft = PeftModel.from_pretrained(base_model, str(args.sft_adapter_dir))
+        base_model = sft_peft.merge_and_unload()
+        del sft_peft
+        torch.cuda.empty_cache()
+
+    module_pairs = [(n, type(m).__name__) for n, m in base_model.named_modules()]
+    targets = discover_qwen38_lora_targets(module_pairs, require_deltanet=True)
+    peft_kwargs = build_qwen38_peft_lora_kwargs(spec)
+    peft_kwargs["target_modules"] = targets
+    peft_model = get_peft_model(base_model, LoraConfig(**peft_kwargs))
 
     peft_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     ddp_model = DDP(peft_model, device_ids=[local_rank], find_unused_parameters=False)
