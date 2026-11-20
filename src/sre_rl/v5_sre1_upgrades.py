@@ -120,8 +120,8 @@ def sample_group_harness(
         c2a[canon] = picked
         a2c[picked] = canon
 
-    sampled_turns = rng.choice((10, 12, 14, 18, 22))
-    sampled_ctx = rng.choice((8192, 12288, 16384, 24576))
+    sampled_turns = rng.choice((10, 12, 14, 16))
+    sampled_ctx = rng.choice((6144, 7168, 8192))
     return SampledHarnessConfig(
         is_canonical=False,
         max_turns=sampled_turns,

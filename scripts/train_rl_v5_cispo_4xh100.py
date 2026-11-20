@@ -436,7 +436,7 @@ def main() -> None:
     eval_slice = heldout_scenarios[: args.eval_heldout_count]
 
     curriculum = ReturningPoolCurriculum(len(train_scenarios), seed=args.seed)
-    canonical_harness = sample_group_harness(rng, args.max_turns, 12288, randomize_prob=0.0)
+    canonical_harness = sample_group_harness(rng, args.max_turns, 8192, randomize_prob=0.0)
     dapo_cfg = DAPOConfig(
         group_size=args.group_size,
         gamma=0.92,
@@ -488,7 +488,7 @@ def main() -> None:
             n_cand = args.prompts_per_step * args.oversample_factor
             cand_indices = curriculum.sample_candidates(step, n_cand)
             cand_harnesses = [
-                sample_group_harness(rng, args.max_turns, 12288, randomize_prob=0.50)
+                sample_group_harness(rng, args.max_turns, 8192, randomize_prob=0.50)
                 for _ in cand_indices
             ]
 
@@ -538,8 +538,11 @@ def main() -> None:
                 stats = [t[2] for t in traces]
                 advs, masks = compute_gtpo_hybrid_advantages(items, config=dapo_cfg)
                 for idx, tr in enumerate(traces):
-                    if float(np.sum(masks[idx][1:])) > 0.0 and len(tr[0]) > 2:
-                        payload_for_ranks.append((tr[0], advs[idx], masks[idx]))
+                    seq_t = tr[0][:7168]
+                    adv_t_np = advs[idx][: len(seq_t)]
+                    mask_t_np = masks[idx][: len(seq_t)]
+                    if float(np.sum(mask_t_np[1:])) > 0.0 and len(seq_t) > 2:
+                        payload_for_ranks.append((seq_t, adv_t_np, mask_t_np))
                 all_rew.extend(it.outcome_reward for it in items)
                 all_mit.extend(s["mitigated"] for s in stats)
                 all_safe.extend(s["safety_violated"] for s in stats)
