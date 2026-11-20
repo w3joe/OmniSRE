@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -161,10 +162,23 @@ def main() -> None:
             ckpt_dir = Path(tmp) / "checkpoint"
             ckpt_dir.mkdir(parents=True, exist_ok=True)
             print(f"[hf] Syncing {args.gcs_checkpoint} -> {ckpt_dir}...")
-            cmd = ["gcloud", "storage", "rsync", "-r", args.gcs_checkpoint, str(ckpt_dir), "--exclude=step-.*"]
+            cmd = [
+                "gcloud",
+                "storage",
+                "rsync",
+                "-r",
+                args.gcs_checkpoint,
+                str(ckpt_dir),
+                "--exclude=step-.*",
+            ]
             if args.gcloud_account:
                 cmd.append(f"--account={args.gcloud_account}")
-            subprocess.run(cmd, check=True)
+            env = {
+                **os.environ,
+                "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_THRESHOLD": "0",
+                "CLOUDSDK_STORAGE_CHECK_HASHES": "never",
+            }
+            subprocess.run(cmd, check=True, env=env)
 
         assert ckpt_dir is not None and ckpt_dir.exists()
         is_adapter = (ckpt_dir / "adapter_config.json").exists()
