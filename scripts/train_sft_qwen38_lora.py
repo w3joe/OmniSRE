@@ -35,6 +35,12 @@ def main() -> None:
         default=Path("/mnt/nvme/checkpoints/qwen38-27b-sre-sft-merged"),
     )
     parser.add_argument(
+        "--resume-adapter-dir",
+        type=Path,
+        default=None,
+        help="Optional existing LoRA adapter dir to continue Phase 1b SFT from.",
+    )
+    parser.add_argument(
         "--train-jsonl",
         type=Path,
         default=None,
@@ -65,7 +71,7 @@ def main() -> None:
 
     import torch
     from datasets import Dataset
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig, PeftModel, get_peft_model
     from transformers import AutoModelForImageTextToText, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
@@ -92,15 +98,23 @@ def main() -> None:
     freeze_stats = freeze_non_lora_subsystems(model, spec=spec)
     print(f"[sft] Frozen non-LLM params: {freeze_stats}")
 
-    # 2. Verify Gated DeltaNet + Attention LoRA target modules exist in model tree
-    module_pairs = [(name, type(mod).__name__) for name, mod in model.named_modules()]
-    discovered = discover_qwen38_lora_targets(module_pairs, require_deltanet=True)
-    print(f"[sft] Verified Qwen3.8-27B hybrid LoRA leaf targets: {discovered}")
+    # 2. Attach fresh hybrid LoRA OR resume from Stage 1a adapter for Phase 1b schema calibration
+    if (
+        args.resume_adapter_dir is not None
+        and args.resume_adapter_dir.exists()
+        and (args.resume_adapter_dir / "adapter_config.json").exists()
+    ):
+        print(f"[sft] Resuming Phase 1b SFT from adapter: {args.resume_adapter_dir}")
+        model = PeftModel.from_pretrained(model, str(args.resume_adapter_dir), is_trainable=True)
+    else:
+        module_pairs = [(name, type(mod).__name__) for name, mod in model.named_modules()]
+        discovered = discover_qwen38_lora_targets(module_pairs, require_deltanet=True)
+        print(f"[sft] Verified Qwen3.8-27B hybrid LoRA leaf targets: {discovered}")
 
-    peft_kwargs = build_qwen38_peft_lora_kwargs(spec)
-    peft_kwargs["target_modules"] = discovered
-    lora_cfg = LoraConfig(**peft_kwargs)
-    model = get_peft_model(model, lora_cfg)
+        peft_kwargs = build_qwen38_peft_lora_kwargs(spec)
+        peft_kwargs["target_modules"] = discovered
+        lora_cfg = LoraConfig(**peft_kwargs)
+        model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
     # 3. Load cold-start SRE trajectories & apply bounded `preserve_thinking`

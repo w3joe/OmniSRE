@@ -13,6 +13,7 @@ build/
 # Datasets, Checkpoints & Logs
 data/generated/
 data/real_sre_v2/
+data/phase1b_sft_v4/
 outputs/
 checkpoints/
 wandb/
