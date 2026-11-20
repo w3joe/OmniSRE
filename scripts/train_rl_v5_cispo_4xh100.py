@@ -73,10 +73,19 @@ def _chat_template_ids(
     tokenizer,
     messages: list[dict[str, str]],
     add_generation_prompt: bool,
+    reasoning_effort: str = "medium",
 ) -> list[int]:
-    encoded = tokenizer.apply_chat_template(
-        messages, tokenize=True, add_generation_prompt=add_generation_prompt
-    )
+    try:
+        encoded = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            reasoning_effort=reasoning_effort,
+        )
+    except TypeError:
+        encoded = tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=add_generation_prompt
+        )
     if isinstance(encoded, list):
         return [int(t) for t in encoded]
     ids = encoded.input_ids if hasattr(encoded, "input_ids") else encoded["input_ids"]
@@ -102,11 +111,17 @@ def rollout_tito_sglang_episode(
         {"role": "user", "content": alert},
     ]
 
-    # Build initial prompt token stream once; strictly append-only thereafter (true TITO!)
-    token_stream: list[int] = _chat_template_ids(tokenizer, messages, add_generation_prompt=True)
-    im_start_user = tokenizer.encode("<|im_start|>user\n", add_special_tokens=False)
-    im_end_assistant = tokenizer.encode("<|im_end|>\n<|im_start|>assistant\n", add_special_tokens=False)
+    # Build initial prompt token stream once; strictly append-only thereafter (true TITO!).
+    # Note: Qwen3.8's chat_template with `add_generation_prompt=True` ends with
+    # `<|im_start|>assistant\n<think>\n`, so generated `out_ids` begin inside `<think>`.
+    token_stream: list[int] = _chat_template_ids(
+        tokenizer,
+        messages,
+        add_generation_prompt=True,
+        reasoning_effort=scenario.reasoning_effort.value,
+    )
     im_end_toks = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    im_end_id = im_end_toks[0] if im_end_toks else int(tokenizer.eos_token_id)
 
     turn_spans: list[tuple[int, int]] = []
     turn_rewards: list[float] = []
@@ -125,7 +140,7 @@ def rollout_tito_sglang_episode(
                     "temperature": temperature,
                     "top_p": 0.95 if temperature > 0.0 else 1.0,
                     "max_new_tokens": max_new_tokens,
-                    "stop_token_ids": [tokenizer.eos_token_id, *im_end_toks],
+                    "stop_token_ids": list({int(tokenizer.eos_token_id), im_end_id}),
                 },
             },
             timeout=90,
@@ -134,13 +149,19 @@ def rollout_tito_sglang_episode(
             int(t) for t in (resp.get("output_ids") or resp.get("meta_info", {}).get("output_ids") or [])
         ]
         if not out_ids:
-            # Fallback if SGLang build returns `text` only
-            raw_txt = str(resp.get("text", ""))
-            if not raw_txt.strip():
+            raw_body = str(resp.get("text", ""))
+            if not raw_body.strip():
                 break
-            out_ids = tokenizer.encode(raw_txt, add_special_tokens=False)
+            out_ids = tokenizer.encode(raw_body, add_special_tokens=False)
         else:
-            raw_txt = tokenizer.decode(out_ids, skip_special_tokens=True)
+            raw_body = tokenizer.decode(out_ids, skip_special_tokens=True)
+
+        # Reconstruct full `<think>...</think>` wrapper since `<think>\n` was in prompt prefix
+        raw_txt = (
+            f"<think>\n{raw_body}"
+            if "</think>" in raw_body and not raw_body.lstrip().startswith("<think>")
+            else raw_body
+        )
 
         start_pos = len(token_stream)
         token_stream.extend(out_ids)
@@ -186,15 +207,15 @@ def rollout_tito_sglang_episode(
         if done:
             break
 
-        # Append exact ChatML observation suffix tokens without re-encoding prior assistant turns!
-        obs_ids = (
-            im_end_toks
-            + tokenizer.encode("\n", add_special_tokens=False)
-            + im_start_user
-            + tokenizer.encode(f"<tool_response>\n{combined_obs}\n</tool_response>", add_special_tokens=False)
-            + im_end_assistant
+        # Append exact Qwen3.8 ChatML observation + `<think>\n` generation prefix without
+        # re-encoding prior assistant turns (true append-only TITO!)
+        leading_end = "" if (token_stream and token_stream[-1] == im_end_id) else "<|im_end|>"
+        obs_suffix = (
+            f"{leading_end}\n<|im_start|>user\n"
+            f"<tool_response>\n{combined_obs}\n</tool_response><|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n"
         )
-        token_stream.extend(obs_ids)
+        token_stream.extend(tokenizer.encode(obs_suffix, add_special_tokens=False))
 
     ep = env.finalize_episode()
     breakdown = score_episode(scenario, ep)
