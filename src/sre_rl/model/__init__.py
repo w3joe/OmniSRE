@@ -15,6 +15,7 @@ from sre_rl.model.thinking import (
     estimate_tokens,
     format_multiturn_preserve_thinking,
     parse_qwen38_assistant_turn,
+    parse_qwen38_assistant_turn_multi,
 )
 
 __all__ = [
@@ -29,5 +30,6 @@ __all__ = [
     "estimate_tokens",
     "format_multiturn_preserve_thinking",
     "parse_qwen38_assistant_turn",
+    "parse_qwen38_assistant_turn_multi",
     "recommended_qwen38_env_vars",
 ]

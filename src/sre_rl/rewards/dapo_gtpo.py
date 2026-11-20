@@ -14,6 +14,7 @@ Solves three failure modes of vanilla trajectory-level GRPO on 25-turn SRE incid
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -179,3 +180,45 @@ def compute_dapo_clipped_loss_numpy(
     surr2 = clipped_ratio * advantages
     token_obj = np.minimum(surr1, surr2) * action_mask
     return float(-np.sum(token_obj) / active_tokens)
+
+
+def compute_masked_cispo_loss_torch(
+    new_lp: Any,
+    old_lp: Any,
+    active_advantages: Any,
+    ratio_min: float = 0.20,
+    ratio_max: float = 5.00,
+) -> tuple[Any, dict[str, float]]:
+    """Compute ResolveAI SRE-1 / ScaleRL Masked CISPO policy objective (zero KL penalty).
+
+    Formula:
+        r_t = exp(new_lp_t - old_lp_t)
+        M_t = 1[ratio_min <= r_t <= ratio_max]
+        L_CISPO = - mean_t( M_t * stop_grad(min(r_t, ratio_max)) * A_t * new_lp_t )
+    """
+    import torch
+
+    if new_lp.numel() == 0:
+        zero = (new_lp * 0.0).sum()
+        return zero, {"masked_fraction": 0.0, "mean_ratio": 1.0, "approx_k3_kl": 0.0}
+
+    log_ratio = torch.clamp(new_lp - old_lp, -15.0, 15.0)
+    ratio = torch.exp(log_ratio)
+    in_band = (ratio >= ratio_min) & (ratio <= ratio_max)
+    mask_f = in_band.to(dtype=torch.float32)
+
+    # Stop-gradient importance weight inside [ratio_min, ratio_max], zero outside
+    weight = torch.clamp(ratio.detach(), max=ratio_max) * mask_f
+    denom = torch.clamp(mask_f.sum(), min=1.0)
+    loss = -(weight * active_advantages.detach() * new_lp).sum() / denom
+
+    # Schulman k3 KL diagnostic between trainer and sampler (after masking)
+    inv_log_r = -log_ratio
+    k3 = ((torch.exp(torch.clamp(inv_log_r, -10.0, 10.0)) - inv_log_r - 1.0) * mask_f).sum() / denom
+    masked_frac = float(1.0 - (mask_f.sum() / max(1, ratio.numel())).item())
+    mean_r = float(((ratio * mask_f).sum() / denom).item())
+    return loss, {
+        "masked_fraction": round(masked_frac, 4),
+        "mean_ratio": round(mean_r, 4),
+        "approx_k3_kl": round(float(k3.item()), 5),
+    }

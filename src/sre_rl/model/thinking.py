@@ -36,6 +36,7 @@ class ParsedAssistantTurn:
     tool_call: ToolCall | None
     thinking_tokens: int
     parse_error: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 def estimate_tokens(text: str) -> int:
@@ -99,6 +100,82 @@ def parse_qwen38_assistant_turn(raw_text: str) -> ParsedAssistantTurn:
         tool_call=tool_call,
         thinking_tokens=estimate_tokens(thinking),
         parse_error=parse_error,
+        tool_calls=(tool_call,) if tool_call is not None else (),
+    )
+
+
+def parse_qwen38_assistant_turn_multi(
+    raw_text: str,
+    max_parallel_calls: int = 8,
+) -> ParsedAssistantTurn:
+    """Parse 1..N concurrent `<tool_call>{...}</tool_call>` blocks in a single turn (v5)."""
+    think_matches = THINK_BLOCK_RE.findall(raw_text)
+    thinking = "\n".join(m.strip() for m in think_matches if m.strip())
+    without_think = THINK_BLOCK_RE.sub("", raw_text).strip()
+
+    if "<think>" in raw_text and "</think>" not in raw_text:
+        unclosed = raw_text.split("<think>", 1)[1].strip()
+        return ParsedAssistantTurn(
+            thinking=unclosed,
+            visible_content="",
+            tool_call=None,
+            thinking_tokens=estimate_tokens(unclosed),
+            parse_error="unclosed_think_block",
+            tool_calls=(),
+        )
+
+    matches = list(TOOL_CALL_BLOCK_RE.finditer(without_think))
+    visible_content = TOOL_CALL_BLOCK_RE.sub("", without_think).strip()
+    if not matches:
+        has_malformed = "<tool_call>" in without_think
+        return ParsedAssistantTurn(
+            thinking=thinking,
+            visible_content=visible_content,
+            tool_call=None,
+            thinking_tokens=estimate_tokens(thinking),
+            parse_error="malformed_tool_call_tag" if has_malformed else None,
+            tool_calls=(),
+        )
+
+    if len(matches) > max_parallel_calls:
+        return ParsedAssistantTurn(
+            thinking=thinking,
+            visible_content=visible_content,
+            tool_call=None,
+            thinking_tokens=estimate_tokens(thinking),
+            parse_error=f"exceeded_parallel_call_cap:{len(matches)}>{max_parallel_calls}",
+            tool_calls=(),
+        )
+
+    parsed_calls: list[ToolCall] = []
+    for m in matches:
+        try:
+            payload = json.loads(m.group(1))
+            if not isinstance(payload, dict) or "name" not in payload:
+                raise ValueError("Tool call JSON must contain 'name'.")
+            arguments = payload.get("arguments", {})
+            if isinstance(arguments, str):
+                arguments = json.loads(arguments)
+            if not isinstance(arguments, dict):
+                raise TypeError("'arguments' must decode to a JSON object.")
+            parsed_calls.append(ToolCall(name=str(payload["name"]), arguments=arguments))
+        except Exception as exc:  # noqa: BLE001
+            return ParsedAssistantTurn(
+                thinking=thinking,
+                visible_content=visible_content,
+                tool_call=None,
+                thinking_tokens=estimate_tokens(thinking),
+                parse_error=f"invalid_tool_json: {exc}",
+                tool_calls=(),
+            )
+
+    return ParsedAssistantTurn(
+        thinking=thinking,
+        visible_content=visible_content,
+        tool_call=parsed_calls[0],
+        thinking_tokens=estimate_tokens(thinking),
+        parse_error=None,
+        tool_calls=tuple(parsed_calls),
     )
 
 
