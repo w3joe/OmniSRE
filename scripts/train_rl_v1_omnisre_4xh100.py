@@ -300,8 +300,8 @@ def rollout_tier1_write_v1(
     )
     stats = {
         "reward": float(rb.total),
-        "mitigated": float(ep.final_mitigated),
-        "safety_violation": float(ep.safety_violations > 0),
+        "mitigated": float(rb.mitigated),
+        "safety_violation": float(rb.safety_violated or bool(ep.safety_violations)),
         "turns": float(len(turn_spans)),
     }
     return token_stream, item, stats
@@ -620,7 +620,7 @@ def main() -> None:
     parser.add_argument("--eval-heldout-count", type=int, default=40)
     parser.add_argument("--max-turns", type=int, default=24)
     parser.add_argument("--harness-rand-prob", type=float, default=0.60)
-    parser.add_argument("--max-train-seq-len", type=int, default=8192)
+    parser.add_argument("--max-train-seq-len", type=int, default=6656)
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--sync-every", type=int, default=2)
     parser.add_argument("--eval-every", type=int, default=25)
@@ -740,7 +740,8 @@ def main() -> None:
             t1_slice = tier1_heldout[:20]
             canon_t1 = SampledHarnessConfig(is_canonical=True, max_turns=14, max_context_tokens=12_288, show_budget_footer=True, parallel_hint="")
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(t1_slice))) as pool:
-                t1_stats = [pool.submit(rollout_tier1_write_v1, args.sglang_url, tokenizer, sc, canon_t1, 384, 0.0).result()[2] for sc in t1_slice]
+                t1_futs = [pool.submit(rollout_tier1_write_v1, args.sglang_url, tokenizer, sc, canon_t1, 384, 0.0) for sc in t1_slice]
+                t1_stats = [f.result()[2] for f in t1_futs]
             t1_summary = {
                 "n": len(t1_stats),
                 "mitigation_rate": round(float(np.mean([s["mitigated"] for s in t1_stats])), 4),
@@ -889,10 +890,11 @@ def main() -> None:
                 for cid in synth_keys:
                     rec = rec_by_id[cid]
                     with concurrent.futures.ThreadPoolExecutor(max_workers=args.group_size) as pool:
-                        s_trs = [
-                            pool.submit(rollout_offline_synthesis_v1, args.sglang_url, tokenizer, rec, saved_trace_bank[cid], 0.8).result()
+                        s_futs = [
+                            pool.submit(rollout_offline_synthesis_v1, args.sglang_url, tokenizer, rec, saved_trace_bank[cid], 0.8)
                             for _ in range(args.group_size)
                         ]
+                        s_trs = [f.result() for f in s_futs]
                     s_items = [t[1] for t in s_trs]
                     s_rw = np.array([it.outcome_reward for it in s_items], dtype=np.float64)
                     if float(np.std(s_rw)) >= dapo_cfg.min_group_std and float(np.max(s_rw)) >= 0.45:
