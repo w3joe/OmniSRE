@@ -8,7 +8,7 @@ set -euo pipefail
 NVME_MOUNT="/mnt/nvme"
 
 if ! mountpoint -q "${NVME_MOUNT}"; then
-  apt-get update -y && apt-get install -y mdadm xfsprogs jq rsync python3-dev build-essential
+  apt-get update -y && apt-get install -y mdadm xfsprogs jq rsync python3-dev build-essential ninja-build
   NVME_DEVS=($(ls /dev/disk/by-id/google-local-nvme-ssd-* 2>/dev/null || true))
   if [[ ${#NVME_DEVS[@]} -gt 0 ]]; then
     if [[ ! -e /dev/md0 ]]; then
