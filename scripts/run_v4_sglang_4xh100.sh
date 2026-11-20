@@ -43,7 +43,7 @@ gcloud storage rsync -r "${NVME_ROOT}/checkpoints_v4/phase1b-sft-lora64" \
 echo "=== [2/3] Launching SGLang TP2 FP8-KV Rollout Server on GPUs 0,1 ==="
 CUDA_VISIBLE_DEVICES=0,1 python3 -m sglang.launch_server \
   --model-path "${MERGED_P1B}" \
-  --served-model-name qwen38-sre \
+  --served-model-name omnisre-27b \
   --trust-remote-code \
   --tp-size 2 \
   --kv-cache-dtype fp8_e4m3 \
@@ -81,7 +81,7 @@ CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29502 \
   scripts/train_rl_sglang_4xh100.py \
   --base-model-path "${MERGED_P1B}" \
   --sglang-url "http://127.0.0.1:${SGLANG_PORT}" \
-  --served-model qwen38-sre \
+  --served-model omnisre-27b \
   --sync-dir "${NVME_ROOT}/sglang_live_sync" \
   --output-dir "${NVME_ROOT}/checkpoints_v4/rl-sglang-dapo-gtpo" \
   --train-scenarios-jsonl "${NVME_ROOT}/data_v2/rl_real_train.jsonl" \
