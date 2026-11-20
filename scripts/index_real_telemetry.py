@@ -73,6 +73,58 @@ def _index_rcaeval_dir(ds_name: str, root: Path, start_idx: int) -> list[RealInc
     return records
 
 
+def _detect_dejavu_single_entity_format(metrics_path: Path) -> bool:
+    """Return True if DejaVu metrics.csv uses empty `##<metric>` single-host wait-event names (e.g. DejaVu-C)."""
+    norm_p = metrics_path.with_name("metrics.norm.csv")
+    target = norm_p if norm_p.exists() else metrics_path
+    try:
+        with target.open("r", encoding="utf-8", errors="ignore") as fh:
+            reader = csv.DictReader(fh)
+            checked = 0
+            non_empty_prefixes = 0
+            for row in reader:
+                name = str(row.get("name", "")).strip()
+                if not name:
+                    continue
+                checked += 1
+                prefix = name.split("##", 1)[0].strip() if "##" in name else ""
+                if prefix:
+                    non_empty_prefixes += 1
+                if checked >= 200:
+                    break
+            return checked > 0 and non_empty_prefixes == 0
+    except OSError:
+        return False
+
+
+def _clean_dejavu_service_name(row: dict[str, str], is_single_entity: bool) -> str:
+    # DejaVu-A1/A2 have clean `name` column (`docker_003`, `os_021`, `db_007`)
+    direct_name = str(row.get("name") or "").strip()
+    if direct_name:
+        return direct_name
+
+    # DejaVu-C has `entity` column (`metric.platform.bjclpdb01`)
+    entity = str(row.get("entity") or "").strip()
+    if entity:
+        if entity.startswith("metric.platform."):
+            return entity[len("metric.platform.") :]
+        return entity
+
+    # DejaVu-B has `kpi` like `Tomcat03##OSLinux-CPU...` and `root_cause_node` like `Tomcat03 OS CPU`
+    kpi = str(row.get("kpi") or "").strip()
+    if "##" in kpi:
+        first_kpi = kpi.split(";", 1)[0].strip()
+        prefix = first_kpi.split("##", 1)[0].strip()
+        if prefix:
+            return prefix
+
+    rcn = str(row.get("root_cause_node") or "").strip()
+    if rcn and not is_single_entity:
+        # e.g. "Tomcat03 OS CPU" -> "Tomcat03"
+        return rcn.split()[0].split(";")[0].strip()
+    return rcn
+
+
 def _index_dejavu_dir(ds_name: str, root: Path, start_idx: int) -> list[RealIncidentRecord]:
     records: list[RealIncidentRecord] = []
     fault_files = list(root.rglob("faults.csv"))
@@ -83,6 +135,7 @@ def _index_dejavu_dir(ds_name: str, root: Path, start_idx: int) -> list[RealInci
             continue
         graph_p = base_dir / "graph.yml"
         system_name = f"prod-{ds_name.lower()}"
+        is_single_entity = _detect_dejavu_single_entity_format(metrics_p)
 
         with fpath.open("r", encoding="utf-8", errors="ignore") as fh:
             for row in csv.DictReader(fh):
@@ -93,12 +146,7 @@ def _index_dejavu_dir(ds_name: str, root: Path, start_idx: int) -> list[RealInci
                     ts = int(float(raw_ts))
                 except ValueError:
                     continue
-                root_svc = str(
-                    row.get("name")
-                    or row.get("entity")
-                    or row.get("root_cause_node")
-                    or ""
-                ).strip()
+                root_svc = _clean_dejavu_service_name(row, is_single_entity=is_single_entity)
                 fault_type = str(
                     row.get("fault_description")
                     or row.get("node_type")
@@ -120,6 +168,8 @@ def _index_dejavu_dir(ds_name: str, root: Path, start_idx: int) -> list[RealInci
                         metrics_path=str(metrics_p),
                         graph_path=str(graph_p) if graph_p.exists() else None,
                         is_dejavu_long_format=True,
+                        single_entity_alert_host=root_svc if is_single_entity else None,
+                        candidate_services=[root_svc] if is_single_entity else [],
                     )
                 )
     return records

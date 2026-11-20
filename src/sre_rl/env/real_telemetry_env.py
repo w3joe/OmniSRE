@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 import re
 import threading
 from dataclasses import dataclass, field
@@ -39,8 +40,8 @@ class RealIncidentRecord(BaseModel):
     source_dataset: str           # e.g. RE2-SS, RE3-OB, RE3-TT, DejaVu-A1, DejaVu-C
     system_name: str              # sock-shop, online-boutique, train-ticket, bank-a1, oracle-db-c
     inject_timestamp: int         # Unix seconds of fault onset
-    ground_truth_service: str     # e.g. carts, adservice, docker_003, metric.platform.bjclpdb02
-    ground_truth_fault: str       # e.g. cpu, mem, disk, delay, loss, f3, row_lock_contention
+    ground_truth_service: str     # e.g. carts, adservice, docker_003, bjclpdb01
+    ground_truth_fault: str       # e.g. cpu, mem, disk, delay, loss, f3, Row Lock Contention
     metrics_path: str
     simple_metrics_path: str | None = None
     logs_path: str | None = None
@@ -48,6 +49,7 @@ class RealIncidentRecord(BaseModel):
     pod_node_path: str | None = None
     graph_path: str | None = None
     is_dejavu_long_format: bool = False
+    single_entity_alert_host: str | None = None  # Set for single-host DB corpora (e.g. DejaVu-C)
     candidate_services: list[str] = Field(default_factory=list)
 
 
@@ -72,46 +74,194 @@ class RealRCARewardBreakdown:
     predicted_fault: str = ""
 
 
-def build_real_telemetry_system_prompt(max_turns: int = 12) -> str:
-    return (
-        "You are OmniSRE, an autonomous Site Reliability Engineer investigating a REAL production incident "
-        "using live-captured observability telemetry (Prometheus metrics, application logs, and distributed traces).\n\n"
-        "Available Tools (you may emit 1-4 parallel `<tool_call>` blocks per turn for fast triage):\n"
-        "- `list_services`: `{}` — list services/entities and pod-to-node placement.\n"
-        "- `query_metric_anomalies`: `{\"service\": \"\", \"top_k\": 15}` — rank Prometheus KPIs by incident z-score vs. pre-incident baseline.\n"
-        "- `query_service_metrics`: `{\"service\": \"<name>\", \"metric_filter\": \"\"}` — inspect baseline vs. incident stats for one service.\n"
-        "- `search_logs`: `{\"service\": \"\", \"pattern\": \"\", \"errors_only\": true}` — grep real container logs within the alert window.\n"
-        "- `query_traces`: `{\"service\": \"\", \"errors_only\": false, \"min_duration_ms\": 0}` — inspect slow/failing distributed trace spans.\n"
-        "- `submit_rca_report`: `{\"root_service\": \"<exact_service>\", \"fault_type\": \"<cpu|mem|disk|delay|loss|socket|code_fault|lock_contention|other>\", "
-        "\"causal_chain\": \"...\", \"confidence\": 0.9}` — finalize diagnosis.\n\n"
-        f"Protocol: Run >=2 telemetry queries before submitting. Never guess from filenames. Budget: {max_turns} turns.\n"
-        "Wrap concise reasoning in `<think>...</think>` followed by `<tool_call>{...}</tool_call>`."
+REAL_TELEMETRY_ALIAS_BANKS: dict[str, tuple[str, ...]] = {
+    "list_services": ("list_services", "k8s_service_inventory", "topology_list_entities", "cmdb_list_services"),
+    "query_metric_anomalies": ("query_metric_anomalies", "promql_top_anomalies", "datadog_anomaly_rank", "grafana_detect_spikes"),
+    "query_service_metrics": ("query_service_metrics", "promql_service_kpis", "datadog_host_metrics", "metrics_get_series"),
+    "search_logs": ("search_logs", "loki_search_logs", "splunk_grep_events", "kibana_query_logs"),
+    "query_traces": ("query_traces", "jaeger_trace_spans", "otel_slow_traces", "tempo_query_spans"),
+    "submit_rca_report": ("submit_rca_report", "pagerduty_submit_rca", "close_incident_rca", "resolve_root_cause"),
+}
+
+_REAL_PARALLEL_HINTS: tuple[str, ...] = (
+    "You may emit 1-4 parallel `<tool_call>` blocks per turn for fast triage.",
+    "Batch independent read-only telemetry queries (metrics + logs + traces) in one turn (up to 4 parallel `<tool_call>` blocks).",
+    "Concurrent read execution is supported: inspect topology and top anomalies together on turn 1.",
+    "Run parallel read-only queries to narrow root cause quickly before calling the final submission tool.",
+)
+
+
+@dataclass(frozen=True)
+class RealTelemetryHarnessConfig:
+    """SRE-1 style tool-schema randomization & dual-budget harness for real telemetry RLVR."""
+
+    is_canonical: bool = True
+    max_turns: int = 24
+    max_context_tokens: int = 12_288
+    show_budget_footer: bool = True
+    parallel_hint: str = _REAL_PARALLEL_HINTS[0]
+    canonical_to_alias: dict[str, str] = field(default_factory=dict)
+    alias_to_canonical: dict[str, str] = field(default_factory=dict)
+
+    def tool_name(self, canonical: str) -> str:
+        return self.canonical_to_alias.get(canonical, canonical)
+
+    def resolve_tool_name(self, raw_name: str) -> str:
+        norm = raw_name.strip().lower()
+        return self.alias_to_canonical.get(norm, norm)
+
+    def build_system_prompt(self) -> str:
+        t_list = self.tool_name("list_services")
+        t_anom = self.tool_name("query_metric_anomalies")
+        t_svc = self.tool_name("query_service_metrics")
+        t_logs = self.tool_name("search_logs")
+        t_trc = self.tool_name("query_traces")
+        t_sub = self.tool_name("submit_rca_report")
+        return (
+            "You are OmniSRE, an autonomous Site Reliability Engineer investigating a REAL production incident "
+            "using live-captured observability telemetry (Prometheus/DB metrics, application logs, and distributed traces).\n\n"
+            f"Available Tools ({self.parallel_hint}):\n"
+            f"- `{t_list}`: `{{}}` — list services/entities and pod-to-node placement.\n"
+            f"- `{t_anom}`: `{{\"service\": \"\", \"top_k\": 15}}` — rank KPIs by incident z-score vs. pre-incident baseline.\n"
+            f"- `{t_svc}`: `{{\"service\": \"<name>\", \"metric_filter\": \"\"}}` — inspect baseline vs. incident stats for one service/host.\n"
+            f"- `{t_logs}`: `{{\"service\": \"\", \"pattern\": \"\", \"errors_only\": true}}` — grep real container logs within the alert window.\n"
+            f"- `{t_trc}`: `{{\"service\": \"\", \"errors_only\": false, \"min_duration_ms\": 0}}` — inspect slow/failing distributed trace spans.\n"
+            f"- `{t_sub}`: `{{\"root_service\": \"<exact_service>\", \"fault_type\": \"<cpu|mem|disk|delay|loss|socket|code_fault|lock_contention|other>\", "
+            "\"causal_chain\": \"...\", \"confidence\": 0.9}` — finalize diagnosis.\n\n"
+            f"Protocol: Run >=2 telemetry queries before calling `{t_sub}`. Never guess from filenames. "
+            f"Budget: max_turns={self.max_turns}, max_context_tokens={self.max_context_tokens}.\n"
+            "Wrap concise reasoning in `<think>...</think>` followed by `<tool_call>{...}</tool_call>`."
+        )
+
+    def format_budget_footer(self, turn_idx: int, used_tokens: int) -> str:
+        if not self.show_budget_footer:
+            return ""
+        rem_turns = max(0, self.max_turns - (turn_idx + 1))
+        rem_toks = max(0, self.max_context_tokens - used_tokens)
+        sub_name = self.tool_name("submit_rca_report")
+        footer = f"\n[budget: turns_remaining={rem_turns}/{self.max_turns} | tokens_remaining={rem_toks}]"
+        if rem_turns <= 2:
+            footer += f"\n[WARNING: Budget nearly exhausted — call `{sub_name}` now.]"
+        return footer
+
+
+def sample_real_telemetry_harness(
+    rng: random.Random,
+    default_max_turns: int = 24,
+    default_max_tokens: int = 12_288,
+    randomize_prob: float = 0.60,
+) -> RealTelemetryHarnessConfig:
+    """Sample canonical (40%) or randomized MCP/observability tool aliases & dual budgets (60%)."""
+    if rng.random() >= randomize_prob:
+        return RealTelemetryHarnessConfig(
+            is_canonical=True,
+            max_turns=default_max_turns,
+            max_context_tokens=default_max_tokens,
+            show_budget_footer=True,
+            parallel_hint=_REAL_PARALLEL_HINTS[0],
+        )
+
+    c2a: dict[str, str] = {}
+    a2c: dict[str, str] = {}
+    for canon, choices in REAL_TELEMETRY_ALIAS_BANKS.items():
+        picked = rng.choice(choices)
+        c2a[canon] = picked
+        a2c[picked.lower()] = canon
+
+    turn_choices = tuple(sorted({max(8, default_max_turns // 2), max(12, default_max_turns - 6), default_max_turns}))
+    ctx_choices = tuple(sorted({max(6144, default_max_tokens - 4096), max(8192, default_max_tokens - 2048), default_max_tokens}))
+    return RealTelemetryHarnessConfig(
+        is_canonical=False,
+        max_turns=rng.choice(turn_choices),
+        max_context_tokens=rng.choice(ctx_choices),
+        show_budget_footer=rng.random() < 0.85,
+        parallel_hint=rng.choice(_REAL_PARALLEL_HINTS),
+        canonical_to_alias=c2a,
+        alias_to_canonical=a2c,
     )
 
 
+def build_real_telemetry_system_prompt(
+    max_turns: int = 12,
+    harness: RealTelemetryHarnessConfig | None = None,
+) -> str:
+    if harness is not None:
+        return harness.build_system_prompt()
+    return RealTelemetryHarnessConfig(is_canonical=True, max_turns=max_turns).build_system_prompt()
+
+
 def _normalize_service_token(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+    cleaned = name.strip().lower()
+    for prefix in ("metric.platform.", "platform.", "pod/", "svc/", "deployment/"):
+        cleaned = cleaned.removeprefix(prefix)
+    return re.sub(r"[^a-z0-9]", "", cleaned)
+
+
+def _canonicalize_single_fault(token: str) -> set[str]:
+    t = token.strip().lower()
+    if not t or re.fullmatch(r"\d+", t):
+        return {"other"}
+
+    out: set[str] = set()
+    if any(k in t for k in ("cpu", "throttl")):
+        out.add("cpu")
+    if any(k in t for k in ("mem", "oom", "heap")):
+        out.add("mem")
+    if any(k in t for k in ("logfile", "dbfile", "asm control", "disk", "io", "storage", "fs", "redo")):
+        out.add("disk")
+    if "dbfile" in t:
+        out.add("lock_contention")
+    if any(k in t for k in ("delay", "latenc", "slow", "timeout")):
+        out.add("delay")
+    if any(k in t for k in ("loss", "drop", "packet")):
+        out.add("loss")
+    if "network" in t and not ({"delay", "loss"} & out):
+        # Generic "OS Network" fault without delay/loss subtype accepts any network-class diagnosis
+        out.update({"delay", "loss", "socket"})
+    if any(k in t for k in ("socket", "conn", "port", "tcp")):
+        out.add("socket")
+    if any(
+        k in t
+        for k in (
+            "lock",
+            "contention",
+            "deadlock",
+            "global cache",
+            "buffer busy",
+            "cachelock",
+            "execution",
+            "parse",
+            "sql",
+            "db close",
+            "db  close",
+            "db connection",
+        )
+    ):
+        out.add("lock_contention")
+    if re.fullmatch(r"f\d+", t) or any(k in t for k in ("code", "bug", "app", "exception", "500")):
+        out.add("code_fault")
+
+    return out or {t}
+
+
+def _canonicalize_fault_set(raw: str) -> set[str]:
+    """Map single or compound (`;`-delimited) real fault labels into the canonical fault taxonomy."""
+    parts = [p.strip() for p in re.split(r"[;,|/]+", raw) if p.strip()]
+    if not parts:
+        return {"other"}
+    merged: set[str] = set()
+    for part in parts:
+        merged.update(_canonicalize_single_fault(part))
+    return merged or {"other"}
 
 
 def _canonicalize_fault_type(raw: str) -> str:
-    t = raw.strip().lower()
-    if any(k in t for k in ("cpu", "throttl")):
-        return "cpu"
-    if any(k in t for k in ("mem", "oom", "heap")):
-        return "mem"
-    if any(k in t for k in ("disk", "io", "storage", "fs")):
-        return "disk"
-    if any(k in t for k in ("delay", "latenc", "slow", "timeout")):
-        return "delay"
-    if any(k in t for k in ("loss", "drop", "packet", "network")):
-        return "loss"
-    if any(k in t for k in ("socket", "conn", "port", "tcp")):
-        return "socket"
-    if any(k in t for k in ("lock", "contention", "deadlock", "db", "sql", "execution")):
-        return "lock_contention"
-    if re.fullmatch(r"f\d+", t) or any(k in t for k in ("code", "bug", "app", "exception", "500")):
-        return "code_fault"
-    return t or "other"
+    """Backwards-compatible primary canonical fault label."""
+    fset = _canonicalize_fault_set(raw)
+    for pref in ("cpu", "mem", "disk", "delay", "loss", "socket", "lock_contention", "code_fault", "other"):
+        if pref in fset:
+            return pref
+    return min(fset)
 
 
 @dataclass
@@ -129,7 +279,7 @@ class _LoadedMetricsCache:
 # 75 MB DejaVu CSVs or re-scan identical Prometheus files across G=8 group rollouts!
 _CACHE_LOCK = threading.Lock()
 _DEJAVU_RAW_TABLE_CACHE: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
-_CASE_SUMMARY_CACHE: dict[tuple[str, int, int, int], _LoadedMetricsCache] = {}
+_CASE_SUMMARY_CACHE: dict[tuple[str, int, int, int, str], _LoadedMetricsCache] = {}
 _CACHE_STATS: dict[str, int] = {"dejavu_file_parses": 0, "case_cache_hits": 0}
 
 
@@ -155,8 +305,10 @@ class RealTelemetryReplayEnvironment:
         pre_window_s: int = 300,
         post_window_s: int = 240,
         max_output_chars: int = 3500,
+        harness: RealTelemetryHarnessConfig | None = None,
     ) -> None:
-        self.max_turns = max_turns
+        self.harness = harness or RealTelemetryHarnessConfig(is_canonical=True, max_turns=max_turns)
+        self.max_turns = self.harness.max_turns if harness is not None else max_turns
         self.pre_window_s = pre_window_s
         self.post_window_s = post_window_s
         self.max_output_chars = max_output_chars
@@ -190,12 +342,18 @@ class RealTelemetryReplayEnvironment:
         if record.traces_path and Path(record.traces_path).exists():
             modalities.append("distributed_traces")
 
+        host_line = (
+            f"Alerted Host/Instance: {record.single_entity_alert_host}\n"
+            if record.single_entity_alert_host
+            else ""
+        )
         return (
             f"[REAL PRODUCTION ALERT] Case: {record.case_id}\n"
             f"System: {record.system_name}\n"
+            f"{host_line}"
             f"Alert Onset Timestamp (Unix): {record.inject_timestamp}\n"
             f"Available Telemetry: {', '.join(modalities)}\n"
-            "Symptom: Anomalous SLI degradation (elevated latency / error budget burn) detected across services.\n"
+            "Symptom: Anomalous SLI degradation (elevated latency / error budget burn / wait-event spike) detected.\n"
             "Investigate the real telemetry and pinpoint the root-cause service and fault type."
         )
 
@@ -222,7 +380,8 @@ class RealTelemetryReplayEnvironment:
             mpath = Path(rec.simple_metrics_path or rec.metrics_path)
             target_p = mpath if mpath.exists() else Path(rec.metrics_path)
 
-        cache_key = (str(target_p), t_start, t0, t_end)
+        default_host = rec.single_entity_alert_host or "cluster-global"
+        cache_key = (str(target_p), t_start, t0, t_end, default_host)
         with _CACHE_LOCK:
             cached = _CASE_SUMMARY_CACHE.get(cache_key)
             if cached is not None:
@@ -231,7 +390,7 @@ class RealTelemetryReplayEnvironment:
                 return cached
 
         if rec.is_dejavu_long_format:
-            cache = self._load_dejavu_long_metrics(target_p, t_start, t0, t_end)
+            cache = self._load_dejavu_long_metrics(target_p, t_start, t0, t_end, default_host=default_host)
         else:
             cache = self._load_wide_prometheus_metrics(target_p, t_start, t0, t_end)
 
@@ -356,6 +515,7 @@ class RealTelemetryReplayEnvironment:
         t_start: int,
         t_inject: int,
         t_end: int,
+        default_host: str = "cluster-global",
     ) -> _LoadedMetricsCache:
         """Query pre-indexed in-memory DejaVu table in <3ms using binary search (`searchsorted`)."""
         if not path.exists():
@@ -375,7 +535,7 @@ class RealTelemetryReplayEnvironment:
             if p_arr.size < 2 or i_arr.size < 2:
                 continue
 
-            svc = metric_key.split("##", 1)[0] or "cluster-global"
+            svc = metric_key.split("##", 1)[0] or default_host
             services_set.add(svc)
             p_mean = float(np.mean(p_arr))
             p_std = float(np.std(p_arr))
@@ -439,7 +599,7 @@ class RealTelemetryReplayEnvironment:
         )
 
     def _dispatch_tool(self, call: ToolCall) -> tuple[str, bool, float]:
-        name = call.name.strip().lower()
+        name = self.harness.resolve_tool_name(call.name)
         args = call.arguments
         rec = self.record
 
@@ -673,17 +833,38 @@ class RealTelemetryReplayEnvironment:
         gt_svc_norm = _normalize_service_token(rec.ground_truth_service)
         pred_svc_norm = _normalize_service_token(pred_svc)
 
-        # 1. Root-Cause Service Match (max 0.65)
+        # 1. Root-Cause Service Match
         svc_score = 0.0
         if pred_svc_norm and (pred_svc_norm == gt_svc_norm):
             svc_score = 0.65
         elif pred_svc_norm and (gt_svc_norm in pred_svc_norm or pred_svc_norm in gt_svc_norm):
             svc_score = 0.50
 
-        # 2. Fault Type Match (max 0.25)
-        gt_fault_canon = _canonicalize_fault_type(rec.ground_truth_fault)
-        pred_fault_canon = _canonicalize_fault_type(pred_fault)
-        fault_score = 0.25 if pred_fault_canon == gt_fault_canon else 0.0
+        # 2. Fault Type Match (handles compound `;`-delimited & Oracle wait-event fault taxonomies)
+        gt_fault_set = _canonicalize_fault_set(rec.ground_truth_fault)
+        pred_fault_set = _canonicalize_fault_set(pred_fault)
+        fault_matched = bool(pred_fault_set & gt_fault_set)
+        fault_score = 0.25 if fault_matched else 0.0
+
+        # For single-entity DB instances (e.g. DejaVu-C where the alerted host is given in the alert),
+        # re-weight so the model MUST diagnose the true wait-event fault mechanism to earn high reward!
+        if rec.single_entity_alert_host:
+            svc_weight = 0.25 if svc_score >= 0.50 else 0.0
+            fault_weight = 0.65 if fault_matched else 0.0
+            grounding_bonus = 0.10 if (fault_matched and self._read_queries >= 2) else 0.0
+            eff_pen = min(0.35, 0.04 * self._duplicate_calls + 0.05 * self._syntax_errors)
+            total = round(max(-0.5, svc_weight + fault_weight + grounding_bonus - eff_pen), 4)
+            solved = (svc_score >= 0.50) and (fault_matched or gt_fault_set == {"other"})
+            return RealRCARewardBreakdown(
+                total=total,
+                service_exact_score=svc_score,
+                fault_type_score=fault_score,
+                evidence_grounding_bonus=grounding_bonus,
+                efficiency_penalty=round(eff_pen, 4),
+                solved=solved,
+                predicted_service=pred_svc,
+                predicted_fault=pred_fault,
+            )
 
         # 3. Multi-Modal Evidence Grounding Bonus (max 0.10, gated on correct service!)
         grounding_bonus = 0.0
@@ -694,7 +875,9 @@ class RealTelemetryReplayEnvironment:
 
         eff_pen = min(0.35, 0.04 * self._duplicate_calls + 0.05 * self._syntax_errors)
         total = round(max(-0.5, svc_score + fault_score + grounding_bonus - eff_pen), 4)
-        solved = svc_score >= 0.50 and (fault_score > 0.0 or gt_fault_canon == "code_fault")
+        solved = svc_score >= 0.50 and (
+            fault_matched or ("code_fault" in gt_fault_set) or (gt_fault_set == {"other"})
+        )
 
         return RealRCARewardBreakdown(
             total=total,
