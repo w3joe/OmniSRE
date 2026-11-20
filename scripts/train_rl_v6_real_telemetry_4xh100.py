@@ -388,7 +388,10 @@ def main() -> None:
     parser.add_argument("--eval-heldout-count", type=int, default=30)
     parser.add_argument("--max-turns", type=int, default=10)
     parser.add_argument("--lr", type=float, default=3e-6)
+    parser.add_argument("--sync-every", type=int, default=2, help="Sync SGLang weights every N steps (max_staleness <= 2)")
     parser.add_argument("--eval-every", type=int, default=20)
+    parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument("--gcs-backup-prefix", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -574,9 +577,27 @@ def main() -> None:
         optimizer.step()
 
         if local_rank == 0:
-            sync_s = sync_lora_weights_to_sglang(peft_model, tokenizer, args.sglang_url, args.sync_dir, args.base_model_path)
+            should_sync = (step % max(1, args.sync_every) == 0) or (step == args.steps) or (
+                args.eval_every > 0 and step % args.eval_every == 0
+            )
+            sync_s = (
+                sync_lora_weights_to_sglang(peft_model, tokenizer, args.sglang_url, args.sync_dir, args.base_model_path)
+                if should_sync
+                else 0.0
+            )
             step_metrics.update({"loss": round(loss_accum, 4), "grad_norm": round(grad_norm, 3), "sync_s": round(sync_s, 1), "step_time_s": round(time.time() - t0, 1)})
             print(json.dumps(step_metrics), flush=True)
+            if args.save_every > 0 and step % args.save_every == 0:
+                step_dir = args.output_dir / f"step-{step:03d}"
+                step_dir.mkdir(parents=True, exist_ok=True)
+                peft_model.save_pretrained(step_dir)
+                if args.gcs_backup_prefix:
+                    import subprocess
+
+                    subprocess.run(
+                        ["gcloud", "storage", "rsync", "-r", str(step_dir), f"{args.gcs_backup_prefix.rstrip('/')}/step-{step:03d}", "--quiet"],
+                        check=False,
+                    )
             if args.eval_every > 0 and step % args.eval_every == 0:
                 ev = _eval_unseen(f"step_{step:03d}")
                 if ev.get("service_exact_acc", 0.0) >= best_svc_acc:
@@ -585,6 +606,13 @@ def main() -> None:
                     best_dir.mkdir(parents=True, exist_ok=True)
                     peft_model.save_pretrained(best_dir)
                     tokenizer.save_pretrained(best_dir)
+                    if args.gcs_backup_prefix:
+                        import subprocess
+
+                        subprocess.run(
+                            ["gcloud", "storage", "rsync", "-r", str(best_dir), f"{args.gcs_backup_prefix.rstrip('/')}/best_checkpoint", "--quiet"],
+                            check=False,
+                        )
         dist.barrier()
 
     after_eval = _eval_unseen("after_rl_v6_final")

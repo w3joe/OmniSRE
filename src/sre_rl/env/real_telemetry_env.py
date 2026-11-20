@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -124,6 +125,27 @@ class _LoadedMetricsCache:
     )
 
 
+# Process-wide thread-safe caches so 24 concurrent rollout threads NEVER re-parse
+# 75 MB DejaVu CSVs or re-scan identical Prometheus files across G=8 group rollouts!
+_CACHE_LOCK = threading.Lock()
+_DEJAVU_RAW_TABLE_CACHE: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+_CASE_SUMMARY_CACHE: dict[tuple[str, int, int, int], _LoadedMetricsCache] = {}
+_CACHE_STATS: dict[str, int] = {"dejavu_file_parses": 0, "case_cache_hits": 0}
+
+
+def clear_real_telemetry_caches() -> None:
+    with _CACHE_LOCK:
+        _DEJAVU_RAW_TABLE_CACHE.clear()
+        _CASE_SUMMARY_CACHE.clear()
+        _CACHE_STATS["dejavu_file_parses"] = 0
+        _CACHE_STATS["case_cache_hits"] = 0
+
+
+def get_real_telemetry_cache_stats() -> dict[str, int]:
+    with _CACHE_LOCK:
+        return dict(_CACHE_STATS)
+
+
 class RealTelemetryReplayEnvironment:
     """Interactive multi-turn RLVR environment backed by real CSV telemetry files on disk."""
 
@@ -195,14 +217,29 @@ class RealTelemetryReplayEnvironment:
         if rec.is_dejavu_long_format:
             raw_p = Path(rec.metrics_path)
             norm_p = raw_p.with_name("metrics.norm.csv")
-            cache = self._load_dejavu_long_metrics(
-                norm_p if norm_p.exists() else raw_p, t_start, t0, t_end
-            )
+            target_p = norm_p if norm_p.exists() else raw_p
         else:
             mpath = Path(rec.simple_metrics_path or rec.metrics_path)
-            if not mpath.exists():
-                mpath = Path(rec.metrics_path)
-            cache = self._load_wide_prometheus_metrics(mpath, t_start, t0, t_end)
+            target_p = mpath if mpath.exists() else Path(rec.metrics_path)
+
+        cache_key = (str(target_p), t_start, t0, t_end)
+        with _CACHE_LOCK:
+            cached = _CASE_SUMMARY_CACHE.get(cache_key)
+            if cached is not None:
+                _CACHE_STATS["case_cache_hits"] += 1
+                self._metrics_cache = cached
+                return cached
+
+        if rec.is_dejavu_long_format:
+            cache = self._load_dejavu_long_metrics(target_p, t_start, t0, t_end)
+        else:
+            cache = self._load_wide_prometheus_metrics(target_p, t_start, t0, t_end)
+
+        with _CACHE_LOCK:
+            # Cap case summary cache at 1,500 entries (~30 MB RAM)
+            if len(_CASE_SUMMARY_CACHE) > 1500:
+                _CASE_SUMMARY_CACHE.clear()
+            _CASE_SUMMARY_CACHE[cache_key] = cache
 
         self._metrics_cache = cache
         return cache
@@ -274,57 +311,77 @@ class RealTelemetryReplayEnvironment:
         return _LoadedMetricsCache(services=sorted(services_set), summary_rows=summary_rows)
 
     @staticmethod
-    def _load_dejavu_long_metrics(
-        path: Path,
-        t_start: int,
-        t_inject: int,
-        t_end: int,
-    ) -> _LoadedMetricsCache:
-        """Load DejaVu real bank/cloud long-format `name,timestamp,value[,metric_type]` CSV."""
-        if not path.exists():
-            return _LoadedMetricsCache(services=[])
+    def _get_or_parse_dejavu_table(path: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        key = str(path)
+        with _CACHE_LOCK:
+            existing = _DEJAVU_RAW_TABLE_CACHE.get(key)
+            if existing is not None:
+                return existing
 
-        pre_map: dict[str, list[float]] = {}
-        inc_map: dict[str, list[float]] = {}
-
+        # Parse once per CSV file into sorted (timestamps_int64, values_float32) arrays
+        raw_ts: dict[str, list[int]] = {}
+        raw_vals: dict[str, list[float]] = {}
         with path.open("r", encoding="utf-8", errors="ignore") as fh:
             reader = csv.DictReader(fh)
             for row in reader:
                 try:
                     ts = int(float(row["timestamp"]))
-                except (KeyError, ValueError):
-                    continue
-                if ts < t_start or ts > t_end:
-                    continue
-                name = str(row.get("name", "")).strip()
-                if not name:
-                    continue
-                try:
                     val = float(row["value"])
                 except (KeyError, ValueError):
                     continue
                 if not np.isfinite(val):
                     continue
-                target = pre_map if ts < t_inject else inc_map
-                target.setdefault(name, []).append(val)
+                name = str(row.get("name", "")).strip()
+                if not name:
+                    continue
+                raw_ts.setdefault(name, []).append(ts)
+                raw_vals.setdefault(name, []).append(val)
 
+        indexed: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for name, ts_list in raw_ts.items():
+            ts_arr = np.array(ts_list, dtype=np.int64)
+            v_arr = np.array(raw_vals[name], dtype=np.float32)
+            order = np.argsort(ts_arr)
+            indexed[name] = (ts_arr[order], v_arr[order])
+
+        with _CACHE_LOCK:
+            _DEJAVU_RAW_TABLE_CACHE[key] = indexed
+            _CACHE_STATS["dejavu_file_parses"] += 1
+        return indexed
+
+    @classmethod
+    def _load_dejavu_long_metrics(
+        cls,
+        path: Path,
+        t_start: int,
+        t_inject: int,
+        t_end: int,
+    ) -> _LoadedMetricsCache:
+        """Query pre-indexed in-memory DejaVu table in <3ms using binary search (`searchsorted`)."""
+        if not path.exists():
+            return _LoadedMetricsCache(services=[])
+
+        table = cls._get_or_parse_dejavu_table(path)
         services_set: set[str] = set()
         summary_rows: list[tuple[str, str, float, float, float, float, float, float]] = []
-        for metric_key, i_list in inc_map.items():
-            p_list = pre_map.get(metric_key, [])
-            if len(p_list) < 2 or len(i_list) < 2:
+
+        for metric_key, (ts_arr, v_arr) in table.items():
+            i0 = int(np.searchsorted(ts_arr, t_start, side="left"))
+            i_mid = int(np.searchsorted(ts_arr, t_inject, side="left"))
+            i1 = int(np.searchsorted(ts_arr, t_end, side="right"))
+
+            p_arr = v_arr[i0:i_mid]
+            i_arr = v_arr[i_mid:i1]
+            if p_arr.size < 2 or i_arr.size < 2:
                 continue
+
             svc = metric_key.split("##", 1)[0] or "cluster-global"
             services_set.add(svc)
-            p_arr = np.array(p_list, dtype=np.float64)
-            i_arr = np.array(i_list, dtype=np.float64)
             p_mean = float(np.mean(p_arr))
             p_std = float(np.std(p_arr))
             i_mean = float(np.mean(i_arr))
             i_p95 = float(np.percentile(i_arr, 95))
             i_max = float(np.max(i_arr))
-            # On DejaVu `metrics.norm.csv`, values are already global z-scores; combine
-            # local delta with absolute magnitude so true bank outages rank above zero-jitter.
             denom = max(p_std, abs(p_mean) * 0.10, 0.25)
             local_z = max(abs(i_mean - p_mean) / denom, 0.75 * abs(i_p95 - p_mean) / denom)
             z = float(min(250.0, local_z))

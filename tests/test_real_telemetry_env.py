@@ -2,7 +2,12 @@
 
 from pathlib import Path
 
-from sre_rl.env.real_telemetry_env import RealIncidentRecord, RealTelemetryReplayEnvironment
+from sre_rl.env.real_telemetry_env import (
+    RealIncidentRecord,
+    RealTelemetryReplayEnvironment,
+    clear_real_telemetry_caches,
+    get_real_telemetry_cache_stats,
+)
 
 
 def test_real_telemetry_env_wide_prometheus_logs_traces(tmp_path: Path) -> None:
@@ -79,6 +84,7 @@ def test_real_telemetry_env_dejavu_long_format(tmp_path: Path) -> None:
         metrics_path=str(metrics_csv),
         is_dejavu_long_format=True,
     )
+    clear_real_telemetry_caches()
     env = RealTelemetryReplayEnvironment()
     env.reset(rec)
     out = env.step(
@@ -95,3 +101,11 @@ def test_real_telemetry_env_dejavu_long_format(tmp_path: Path) -> None:
     score = env.score()
     assert score.solved is True
     assert score.total >= 0.90
+
+    # Verify in-memory shared cache prevents re-parsing the same DejaVu CSV across rollouts!
+    env2 = RealTelemetryReplayEnvironment()
+    env2.reset(rec)
+    env2.step('<think>Check anomalies</think><tool_call>{"name": "query_metric_anomalies", "arguments": {"top_k": 3}}</tool_call>')
+    stats = get_real_telemetry_cache_stats()
+    assert stats["dejavu_file_parses"] == 1
+    assert stats["case_cache_hits"] >= 1
