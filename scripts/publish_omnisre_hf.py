@@ -33,27 +33,26 @@ def build_model_card(
     if eval_summary:
         before = eval_summary.get("before_rl") or {}
         after = eval_summary.get("after_rl") or {}
+
+        def row(name: str, d: dict[str, Any]) -> str:
+            return (
+                f"| {name} | {d.get('num_heldout', '-')} | {d.get('mean_reward', '-')} | "
+                f"{d.get('mitigation_rate', '-')} | {d.get('safety_violation_rate', '-')} | "
+                f"{d.get('avg_turns', '-')} |\n"
+            )
+
         eval_section = (
-            "## Held-Out Real-World SRE Evaluation\n\n"
-            "Evaluated on unseen real OpenShift / kube-prometheus / Awesome-Prometheus-Alerts "
-            "topologies strictly held out from training (`0` topology overlap, `0` prompt overlap):\n\n"
-            "| Stage | Scenarios | Mean Reward | Mitigation Rate | Safety Violation Rate | Avg Turns |\n"
-            "| :--- | :---: | :---: | :---: | :---: | :---: |\n"
-            f"| Stage 1 SFT *(Before RL)* | {before.get('num_heldout', '-')} | "
-            f"{before.get('mean_reward', '-')} | {before.get('mitigation_rate', '-')} | "
-            f"{before.get('safety_violation_rate', '-')} | {before.get('avg_turns', '-')} |\n"
-            f"| Stage 2 RLVR *(After DAPO+GTPO)* | {after.get('num_heldout', '-')} | "
-            f"{after.get('mean_reward', '-')} | {after.get('mitigation_rate', '-')} | "
-            f"{after.get('safety_violation_rate', '-')} | {after.get('avg_turns', '-')} |\n\n"
+            "## Held-out evaluation\n\n"
+            "Unseen OpenShift, kube-prometheus and Prometheus-alert topologies "
+            "(zero topology or prompt overlap with training).\n\n"
+            "| Stage | Scenarios | Reward | Mitigated | Safety violations | Turns |\n"
+            "| :-- | --: | --: | --: | --: | --: |\n"
+            + row("SFT", before)
+            + row("SFT + RLVR", after)
+            + "\n"
         )
 
-    artifact_note = (
-        "This repository currently hosts the **Rank-64 Hybrid LoRA adapter** (~1.8 GB, adapting all "
-        "48 Gated DeltaNet linear-attention layers + 16 Gated Attention layers + SwiGLU MLPs while "
-        "keeping the Vision Tower frozen) on top of `Qwen/Qwen3.8-27B`."
-        if is_adapter
-        else "This repository hosts merged **BF16 weights** ready for single-GPU FP8/NVFP4 serving."
-    )
+    artifact = f"Rank-64 LoRA adapter for `{base_model}`" if is_adapter else "Merged BF16 weights"
 
     usage_snippet = (
         f"""```python
@@ -61,25 +60,18 @@ import torch
 from peft import PeftModel
 from transformers import AutoModelForImageTextToText, AutoTokenizer
 
-base_id = "{base_model}"
-adapter_id = "{repo_id}"
-
-tokenizer = AutoTokenizer.from_pretrained(base_id, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained("{base_model}", trust_remote_code=True)
 base = AutoModelForImageTextToText.from_pretrained(
-    base_id, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+    "{base_model}", dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
 )
-model = PeftModel.from_pretrained(base, adapter_id)
+model = PeftModel.from_pretrained(base, "{repo_id}")
 ```"""
         if is_adapter
         else f"""```bash
-python3 -m sglang.launch_server \\
-  --model-path {repo_id} \\
-  --served-model-name omnisre-27b \\
-  --trust-remote-code \\
-  --kv-cache-dtype fp8_e4m3 \\
-  --attention-backend flashinfer \\
-  --reasoning-parser qwen3 \\
-  --tool-call-parser qwen3_coder
+python3 -m sglang.launch_server --model-path {repo_id} \\
+  --served-model-name omnisre-27b --trust-remote-code \\
+  --kv-cache-dtype fp8_e4m3 --attention-backend flashinfer \\
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder
 ```"""
     )
 
@@ -102,64 +94,73 @@ tags:
 - omnisre
 ---
 
-<p align="center">
-  <img src="assets/omnisre_hero.png" alt="OmniSRE-27B Hero Banner" width="100%"/>
-</p>
+<img src="assets/omnisre_hero.png" alt="OmniSRE 27B" width="100%"/>
 
-<p align="center">
-  <a href="https://github.com/w3joe/qwen38-sre-rl"><img src="https://img.shields.io/badge/GitHub-Code%20%26%20RLVR%20Pipeline-181717?style=for-the-badge&logo=github" alt="GitHub"/></a>
-  <img src="https://img.shields.io/badge/License-Apache%202.0-10B981?style=for-the-badge" alt="Apache 2.0"/>
-  <img src="https://img.shields.io/badge/Release-{stage_label.replace('-', '--')}-38BDF8?style=for-the-badge" alt="Release"/>
-  <img src="https://img.shields.io/badge/Hardware-1x%20H100%20%2F%20L40S%20FP8-A78BFA?style=for-the-badge" alt="Hardware"/>
-</p>
+**OmniSRE** is an open-weights site reliability engineering agent: it triages, localizes, \
+finds root cause and remediates, and it never writes before it reads.
 
-> **OmniSRE** is an open-weights Site Reliability Engineering agent built so any team can self-host autonomous incident triage, fault localization, RCA, and read-before-write remediation. {artifact_note}
+{artifact} · `{stage_label}` · Apache 2.0 · \
+[Code & training pipeline](https://github.com/w3joe/qwen38-sre-rl)
 
----
+<br/>
 
-### Agent Architecture & Safety Guardrails
+<img src="assets/omnisre_architecture.png" alt="Read-before-write agent loop and hybrid backbone" \
+width="100%"/>
 
-<p align="center">
-  <img src="assets/omnisre_architecture.png" alt="OmniSRE Read-Write Separated Architecture" width="100%"/>
-</p>
+<br/>
 
----
+<img src="assets/omnisre_training_curves.png" alt="Stage 1a and Phase 1b training loss and \
+token accuracy" width="100%"/>
 
-### Training Dynamics *(4× NVIDIA H100)*
+{eval_section}<br/>
 
-<p align="center">
-  <img src="assets/omnisre_training_curves.png" alt="OmniSRE Training Loss and Accuracy Curves" width="100%"/>
-</p>
+<img src="assets/omnisre_dataset_infographic.png" alt="Open SRE corpus and five validation \
+gates" width="100%"/>
 
-{eval_section}---
-
-### Open-Source SRE Corpus & 5-Gate Validation
-
-<p align="center">
-  <img src="assets/omnisre_dataset_infographic.png" alt="OmniSRE Dataset Breakdown and 5-Gate Validation" width="100%"/>
-</p>
-
----
-
-### Quickstart
+## Quickstart
 
 {usage_snippet}
 
 <details>
-<summary><b>Open-Source Corpus Credits & Training Specs</b></summary>
+<summary>Training details</summary>
 
-* **Base:** `{base_model}` (27B Dense 3:1 Hybrid Gated DeltaNet + Gated Attention, 262K native context)
-* **Adapter:** Rank-64 Hybrid LoRA (`466.9M` trainable params / `1.68%`; Vision Encoder & MTP frozen)
-* **Data Sources:** `rmems/incident-response-oncall-trajectories` (Apache-2.0), `openshift/runbooks` (Apache-2.0), `prometheus-operator/runbooks` (Apache-2.0), `samber/awesome-prometheus-alerts`, `SREGym/SREGym` (MIT), `miyad316/sre-agentic-trajectories-devops`, `beatsprom/devops-kubernetes-iac-sft-dpo-2026` (CC-BY-4.0), `nolabs/deepfabric-devops-reasoning-traces`, `Snaseem2026/devops-incident-response`, `danluu/post-mortems`.
-* **Pipeline Repo:** [github.com/w3joe/qwen38-sre-rl](https://github.com/w3joe/qwen38-sre-rl)
+| | |
+| :-- | :-- |
+| Base | `{base_model}` · 64 layers, 3 : 1 Gated DeltaNet / Gated Attention, 262K context |
+| Adapter | LoRA r = 64 on all linear projections · 466.9M trainable (1.68%) |
+| Frozen | Vision tower, MTP head |
+| Stage 1a | 5,038 real SRE traces · 157 steps · loss 3.34 → 0.175 |
+| Phase 1b | 1,559 exact-schema traces · 98 steps · loss 0.057 · 98.5% token accuracy |
+| Next | Read-before-write RLVR with DAPO + GTPO |
+| Hardware | 4 × H100 BF16 for training · 1 × H100 / L40S FP8 for serving |
+
+</details>
+
+<details>
+<summary>Data sources</summary>
+
+`rmems/incident-response-oncall-trajectories` (Apache-2.0) ·
+`nolabs/deepfabric-devops-reasoning-traces` ·
+`miyad316/sre-agentic-trajectories-devops` ·
+`beatsprom/devops-kubernetes-iac-sft-dpo-2026` (CC-BY-4.0) ·
+`Snaseem2026/devops-incident-response` ·
+`samber/awesome-prometheus-alerts` ·
+`openshift/runbooks` (Apache-2.0) ·
+`prometheus-operator/runbooks` (Apache-2.0) ·
+`SREGym/SREGym` (MIT) ·
+`danluu/post-mortems`
 
 </details>
 """
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Publish OmniSRE-27B checkpoint & Model Card to Hugging Face Hub")
-    parser.add_argument("--repo-id", type=str, required=True, help="Target HF repo ID, e.g. w3joe/OmniSRE-27B")
+    parser = argparse.ArgumentParser(
+        description="Publish OmniSRE-27B checkpoint & Model Card to Hugging Face Hub"
+    )
+    parser.add_argument(
+        "--repo-id", type=str, required=True, help="Target HF repo ID, e.g. w3joe/OmniSRE-27B"
+    )
     parser.add_argument("--local-checkpoint", type=Path, default=None)
     parser.add_argument("--gcs-checkpoint", type=str, default=None)
     parser.add_argument("--gcloud-account", type=str, default="onflowai.general@gmail.com")
@@ -199,7 +200,9 @@ def main() -> None:
         assert ckpt_dir is not None and ckpt_dir.exists()
         is_adapter = (ckpt_dir / "adapter_config.json").exists()
         eval_file = ckpt_dir / "trial_eval_summary.json"
-        eval_summary = json.loads(eval_file.read_text(encoding="utf-8")) if eval_file.exists() else None
+        eval_summary = (
+            json.loads(eval_file.read_text(encoding="utf-8")) if eval_file.exists() else None
+        )
 
         card = build_model_card(
             repo_id=args.repo_id,
@@ -220,7 +223,9 @@ def main() -> None:
         api = HfApi()
         user = api.whoami()
         print(f"[hf] Authenticated as: {user.get('name', user.get('fullname', 'unknown'))}")
-        api.create_repo(repo_id=args.repo_id, repo_type="model", private=args.private, exist_ok=True)
+        api.create_repo(
+            repo_id=args.repo_id, repo_type="model", private=args.private, exist_ok=True
+        )
         api.upload_folder(
             folder_path=str(ckpt_dir),
             repo_id=args.repo_id,

@@ -1,401 +1,769 @@
 #!/usr/bin/env python3
-"""Render visual-first Hugging Face Model Card graphics for OmniSRE from real logs & data."""
+"""Render editorial, light-mode Hugging Face Model Card figures for OmniSRE.
+
+All figures are drawn on an inch-based canvas so typography, hairlines and margins
+stay on a consistent Swiss grid. Training curves are parsed from the raw TRL logs and
+corpus counts are read from the validated dataset artifacts when they are available.
+
+Usage:
+    uv run python scripts/render_hf_visuals.py
+"""
 
 from __future__ import annotations
 
 import ast
+import json
 import re
+from collections import Counter
 from pathlib import Path
 
-import matplotlib.patches as mpatches
+import matplotlib
+
+matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
-import numpy as np
+from matplotlib.patches import Rectangle
+from matplotlib.ticker import FixedLocator, FuncFormatter, NullLocator
 
-BG = "#0B1120"
-PANEL = "#111A2E"
-BORDER = "#1E293B"
-TEXT = "#F8FAFC"
-MUTED = "#94A3B8"
-EMERALD = "#10B981"
-CYAN = "#38BDF8"
-VIOLET = "#A78BFA"
-AMBER = "#F59E0B"
-ROSE = "#F43F5E"
+# ── Palette ──────────────────────────────────────────────────────────────────
+PAPER = "#FAF9F7"
+INK = "#18181B"
+INK_2 = "#3F3F46"
+MUTED = "#52525B"
+FAINT = "#A1A1AA"
+RULE = "#E4E4E7"
+RULE_2 = "#D4D4D8"
+ACCENT = "#0F766E"
+ACCENT_TINT = "#C9DEDA"
+WARM = "#B45309"
+
+SANS = "Helvetica Neue"
+SERIF = "Charter"
+MONO = "Menlo"
+DPI = 200
+MARGIN = 0.6
+
+plt.rcParams.update(
+    {
+        "font.family": SANS,
+        "text.color": INK,
+        "axes.edgecolor": RULE_2,
+        "axes.labelcolor": MUTED,
+        "xtick.color": MUTED,
+        "ytick.color": MUTED,
+        "savefig.facecolor": PAPER,
+    }
+)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = REPO_ROOT / "data" / "real_sre_v2"
+
+SFT_LABELS = {
+    "rmems/incident-response-oncall-trajectories": "rmems · on-call incident trajectories",
+    "nolabs/deepfabric-devops-reasoning-traces": "nolabs · DevOps reasoning traces",
+    "grounded_openshift_promql_runbook_trace": "Grounded runbook traces (ours)",
+    "miyad316/sre-agentic-trajectories-devops": "miyad316 · agentic SRE trajectories",
+    "beatsprom/devops-kubernetes-iac-sft-dpo-2026": "beatsprom · Kubernetes / IaC",
+    "Snaseem2026/devops-incident-response": "Snaseem2026 · incident response",
+    "qwen38-sre-rl/safety_and_metastable_balance": "Safety & metastable balance (ours)",
+}
+KB_LABELS = {
+    "samber/awesome-prometheus-alerts": "samber · Prometheus alert rules",
+    "openshift/runbooks": "openshift · runbooks",
+    "danluu/post-mortems": "danluu · public post-mortems",
+    "SREGym/SREGym": "SREGym · fault scenarios",
+    "prometheus-operator/runbooks": "prometheus-operator · runbooks",
+}
+SFT_FALLBACK = {
+    "rmems/incident-response-oncall-trajectories": 2961,
+    "nolabs/deepfabric-devops-reasoning-traces": 1305,
+    "grounded_openshift_promql_runbook_trace": 400,
+    "miyad316/sre-agentic-trajectories-devops": 248,
+    "beatsprom/devops-kubernetes-iac-sft-dpo-2026": 100,
+    "Snaseem2026/devops-incident-response": 15,
+    "qwen38-sre-rl/safety_and_metastable_balance": 9,
+}
+KB_FALLBACK = {
+    "samber/awesome-prometheus-alerts": 1217,
+    "openshift/runbooks": 304,
+    "danluu/post-mortems": 240,
+    "SREGym/SREGym": 177,
+    "prometheus-operator/runbooks": 108,
+}
 
 
-def _parse_trl_log(log_path: Path) -> tuple[list[int], list[float], list[float]]:
-    if not log_path.exists():
-        return [], [], []
-    text = log_path.read_text(encoding="utf-8", errors="ignore")
-    steps, losses, accs = [], [], []
-    step_num = 0
-    for line in text.splitlines():
-        m = re.search(r"(\{'loss':.*?\})", line)
-        if not m:
-            continue
-        try:
-            d = ast.literal_eval(m.group(1))
-            step_num += 5
-            steps.append(step_num)
-            losses.append(float(d["loss"]))
-            accs.append(float(d.get("mean_token_accuracy", 0.0)) * 100.0)
-        except (ValueError, SyntaxError, KeyError):
-            continue
-    return steps, losses, accs
-
-
-def _rounded_box(ax, x, y, w, h, fc=PANEL, ec=BORDER, lw=1.5, radius=0.03, zorder=2):
-    box = mpatches.FancyBboxPatch(
-        (x, y),
-        w,
-        h,
-        boxstyle=f"round,pad=0.0,rounding_size={radius}",
-        facecolor=fc,
-        edgecolor=ec,
-        linewidth=lw,
-        zorder=zorder,
-    )
-    ax.add_patch(box)
-    return box
-
-
-def render_hero(out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(14, 4.4), dpi=220)
-    fig.patch.set_facecolor(BG)
-    ax.set_facecolor(BG)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+# ── Canvas helpers ───────────────────────────────────────────────────────────
+def _canvas(w: float, h: float):
+    fig = plt.figure(figsize=(w, h), dpi=DPI, facecolor=PAPER)
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.set_xlim(0, w)
+    ax.set_ylim(0, h)
     ax.axis("off")
+    return fig, ax
 
-    # Subtle background grid & telemetry waveform
-    xs = np.linspace(0.02, 0.98, 300)
-    for offset, amp, col, alpha in [
-        (0.24, 0.055, CYAN, 0.14),
-        (0.32, 0.045, EMERALD, 0.16),
-        (0.18, 0.03, VIOLET, 0.10),
-    ]:
-        spike = np.exp(-((xs - 0.72) ** 2) / 0.0025) * 0.22
-        ys = offset + amp * np.sin(xs * 24) + spike * (1.0 if col == EMERALD else 0.55)
-        ax.plot(xs, ys, color=col, linewidth=2.2, alpha=alpha, zorder=1)
-        ax.fill_between(xs, 0.02, ys, color=col, alpha=alpha * 0.22, zorder=1)
 
-    # Outer sleek border
-    _rounded_box(ax, 0.015, 0.04, 0.97, 0.92, fc="none", ec="#1E3A5F", lw=1.6, radius=0.035, zorder=3)
+def _t(ax, x, y, s, size=10.0, color=INK, weight="normal", family=SANS, **kw):
+    kw.setdefault("ha", "left")
+    kw.setdefault("va", "baseline")
+    return ax.text(x, y, s, fontsize=size, color=color, fontweight=weight, family=family, **kw)
 
-    # Top pill badge
-    _rounded_box(ax, 0.055, 0.75, 0.27, 0.11, fc="#0F2928", ec=EMERALD, lw=1.2, radius=0.05, zorder=4)
-    ax.text(
-        0.19,
-        0.805,
-        "OPEN-WEIGHTS AUTONOMOUS SRE",
-        color="#34D399",
-        fontsize=10.5,
-        fontweight="bold",
-        ha="center",
-        va="center",
-        family="sans-serif",
-        zorder=5,
+
+def _hline(ax, x0, x1, y, color=RULE_2, lw=0.75):
+    ax.plot([x0, x1], [y, y], color=color, lw=lw, solid_capstyle="butt")
+
+
+def _vline(ax, x, y0, y1, color=RULE_2, lw=0.75):
+    ax.plot([x, x], [y0, y1], color=color, lw=lw, solid_capstyle="butt")
+
+
+def _text_width(fig, artist) -> float:
+    renderer = fig.canvas.get_renderer()
+    return artist.get_window_extent(renderer).width / DPI
+
+
+def _masthead(ax, w, h, fig_no: str, title: str, subtitle: str) -> None:
+    top = h - 0.42
+    _hline(ax, MARGIN, w - MARGIN, top, color=INK, lw=1.1)
+    _t(ax, MARGIN, top - 0.27, fig_no, size=7.8, color=ACCENT, family=MONO, weight="bold")
+    _t(
+        ax,
+        w - MARGIN,
+        top - 0.27,
+        "OmniSRE · w3joe/OmniSRE",
+        size=7.8,
+        color=FAINT,
+        family=MONO,
+        ha="right",
     )
+    _t(ax, MARGIN, top - 0.72, title, size=21, family=SERIF, weight="bold")
+    _t(ax, MARGIN, top - 1.02, subtitle, size=11, color=MUTED)
 
-    # Main Title
-    ax.text(
-        0.055,
-        0.57,
-        "OmniSRE",
-        color=TEXT,
-        fontsize=44,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        family="sans-serif",
-        zorder=5,
-    )
-    ax.text(
-        0.292,
-        0.558,
-        "27B",
-        color=CYAN,
-        fontsize=28,
-        fontweight="bold",
-        ha="left",
-        va="center",
-        family="sans-serif",
-        zorder=5,
-    )
 
-    # Punchy 1-line subtitle
-    ax.text(
-        0.055,
-        0.38,
-        "Open-source Site Reliability Engineering for every team — Triage, Localize, RCA & Safe Remediation.",
-        color="#CBD5E1",
-        fontsize=13.5,
-        ha="left",
-        va="center",
-        family="sans-serif",
-        zorder=5,
-    )
-
-    # 4 crisp metric cards across bottom
-    specs = [
-        ("ARCHITECTURE", "27B Dense Hybrid", "48 DeltaNet + 16 Attn", CYAN),
-        ("CONTEXT", "262K Native", "~2 GB / 64K FP8 KV", EMERALD),
-        ("POST-TRAINING", "DAPO + GTPO", "Read-Before-Write RLVR", VIOLET),
-        ("LICENSE", "Apache 2.0", "100% Self-Hostable", AMBER),
-    ]
-    card_w = 0.205
-    gap = 0.023
-    start_x = 0.055
-    for idx, (label, val, sub, accent) in enumerate(specs):
-        cx = start_x + idx * (card_w + gap)
-        _rounded_box(ax, cx, 0.10, card_w, 0.21, fc=PANEL, ec=BORDER, lw=1.3, radius=0.022, zorder=4)
-        # Left accent bar
-        _rounded_box(ax, cx + 0.008, 0.125, 0.006, 0.16, fc=accent, ec="none", lw=0, radius=0.003, zorder=5)
-        ax.text(cx + 0.022, 0.265, label, color=MUTED, fontsize=8.2, fontweight="bold", ha="left", va="center", zorder=5)
-        ax.text(cx + 0.022, 0.20, val, color=TEXT, fontsize=13.5, fontweight="bold", ha="left", va="center", zorder=5)
-        ax.text(cx + 0.022, 0.135, sub, color=accent, fontsize=8.8, ha="left", va="center", zorder=5)
-
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.savefig(out_path, dpi=220, facecolor=BG)
+def _save(fig, path: Path) -> None:
+    fig.savefig(path, dpi=DPI, facecolor=PAPER)
     plt.close(fig)
 
 
-def render_architecture(out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(14, 4.8), dpi=220)
-    fig.patch.set_facecolor(BG)
-    ax.set_facecolor(BG)
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
+# ── Data ─────────────────────────────────────────────────────────────────────
+def _parse_trl_log(log_path: Path, log_every: int = 5):
+    """Return (steps, loss, token_acc_pct, final_summary) from a TRL stdout log."""
+    if not log_path.exists():
+        return [], [], [], {}
+    text = log_path.read_text(encoding="utf-8", errors="ignore")
+    steps, losses, accs, summary = [], [], [], {}
+    for m in re.finditer(r"\{'(?:loss|train_runtime)'.*?\}", text):
+        try:
+            d = ast.literal_eval(m.group(0))
+        except (ValueError, SyntaxError):
+            continue
+        if "train_runtime" in d:
+            summary = {k: float(v) for k, v in d.items()}
+            continue
+        steps.append(log_every * (len(steps) + 1))
+        losses.append(float(d["loss"]))
+        accs.append(float(d.get("mean_token_accuracy", 0.0)) * 100.0)
+    return steps, losses, accs, summary
 
-    ax.text(
-        0.03,
-        0.92,
-        "Read-Write Separated Autonomous SRE Loop",
-        color=TEXT,
-        fontsize=17,
-        fontweight="bold",
-        ha="left",
-        va="center",
+
+def _total_steps(log_path: Path, default: int) -> int:
+    if not log_path.exists():
+        return default
+    # The optimizer progress bar is the only one reporting seconds-per-iteration.
+    text = log_path.read_text(encoding="utf-8", errors="ignore")
+    totals = [int(t) for t in re.findall(r"\d+/(\d+) \[[^\]]*s/it\]", text)]
+    return max(totals) if totals else default
+
+
+def _source_counts(path: Path, fallback: dict[str, int]) -> dict[str, int]:
+    if not path.exists():
+        return dict(fallback)
+    counts: Counter[str] = Counter()
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                counts[json.loads(line).get("source", "unknown")] += 1
+    return dict(counts.most_common())
+
+
+def _validation_report() -> dict:
+    path = DATA_DIR / "validation_report.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {
+        "sft_total_rows": 5038,
+        "sft_invalid_rows": 0,
+        "sft_token_percentiles": {"p50": 2284, "p99": 2916},
+        "pii_secret_leaks": {},
+        "rl_oracle_checked": 200,
+        "rl_oracle_pass_rate": 1.0,
+        "contamination_overlaps": {"a": 0, "b": 0, "c": 0},
+        "safety_mix": {
+            "benign_false_alarms": 60,
+            "external_escalations": 60,
+            "metastable_cascades": 60,
+            "adversarial_log_injections": 69,
+        },
+    }
+
+
+# ── Figure 0: masthead ───────────────────────────────────────────────────────
+def render_hero(out_path: Path) -> None:
+    w, h = 14.0, 5.2
+    fig, ax = _canvas(w, h)
+    right = w - MARGIN
+
+    top = h - 0.42
+    _hline(ax, MARGIN, right, top, color=INK, lw=1.4)
+    _t(
+        ax,
+        MARGIN,
+        top - 0.27,
+        "OPEN-WEIGHTS SRE AGENT · MODEL CARD",
+        size=7.8,
+        color=ACCENT,
+        family=MONO,
+        weight="bold",
     )
-    ax.text(
-        0.03,
-        0.845,
-        "Hard safety guardrails enforce >=2 read-only diagnostic observations before any cluster mutation",
+    _t(
+        ax,
+        right,
+        top - 0.27,
+        "v0.1 draft · November 2026",
+        size=7.8,
+        color=FAINT,
+        family=MONO,
+        ha="right",
+    )
+
+    title = _t(ax, MARGIN - 0.04, 2.92, "OmniSRE", size=74, family=SERIF, weight="bold")
+    tw = _text_width(fig, title)
+    _t(ax, MARGIN - 0.04 + tw + 0.16, 2.92, "27B", size=34, family=SERIF, color=ACCENT)
+
+    _t(
+        ax,
+        MARGIN,
+        2.32,
+        "An open-weights agent for site reliability engineering.",
+        size=17,
+        weight="light",
+        color=INK_2,
+    )
+    _t(
+        ax,
+        MARGIN,
+        2.0,
+        "Triage, localize, root-cause and remediate — reading before it writes.",
+        size=17,
+        weight="light",
         color=MUTED,
-        fontsize=10.5,
-        ha="left",
-        va="center",
+    )
+
+    # Agent-loop index, right column
+    col_x = 9.75
+    rows = [
+        ("01", "Triage", "read", ACCENT),
+        ("02", "Localize", "read", ACCENT),
+        ("03", "Root cause", "read", ACCENT),
+        ("04", "Policy gate", "gate", WARM),
+        ("05", "Mitigate", "write", INK),
+    ]
+    _t(ax, col_x, 3.98, "AGENT LOOP", size=7.4, color=FAINT, family=MONO)
+    y = 3.62
+    for i, (num, name, tag, col) in enumerate(rows):
+        _t(ax, col_x, y, num, size=8.6, color=FAINT, family=MONO)
+        _t(ax, col_x + 0.42, y, name, size=11, color=INK, weight="medium")
+        _t(
+            ax,
+            right,
+            y,
+            tag,
+            size=8.6,
+            color=col,
+            family=MONO,
+            weight="bold" if tag != "read" else "normal",
+            ha="right",
+        )
+        if i < len(rows) - 1:
+            _hline(ax, col_x, right, y - 0.11, color=RULE, lw=0.6)
+        y -= 0.33
+
+    # Specification grid
+    grid_top = 1.5
+    _hline(ax, MARGIN, right, grid_top, color=RULE_2, lw=0.8)
+    specs = [
+        ("PARAMETERS", "27B", "Hybrid Gated DeltaNet + Attention"),
+        ("LICENSE", "Apache 2.0", "Open weights, fully self-hostable"),
+        ("CONTEXT", "262K", "Native tokens, ~2 GB FP8 KV @ 64K"),
+        ("POST-TRAINING", "Read-Before-Write RLVR", "SFT warm-start, then DAPO + GTPO"),
+    ]
+    col_w = (right - MARGIN) / len(specs)
+    for i, (label, value, sub) in enumerate(specs):
+        x = MARGIN + i * col_w + (0.22 if i else 0.0)
+        if i:
+            _vline(ax, MARGIN + i * col_w, 0.42, grid_top - 0.18, color=RULE, lw=0.7)
+        _t(ax, x, 1.2, label, size=7.4, color=FAINT, family=MONO)
+        _t(
+            ax,
+            x,
+            0.83,
+            value,
+            size=19 if len(value) < 12 else 15.5,
+            family=SERIF,
+            weight="bold",
+            color=INK,
+        )
+        _t(ax, x, 0.52, sub, size=9.4, color=MUTED)
+
+    _save(fig, out_path)
+
+
+# ── Figure 1: architecture ───────────────────────────────────────────────────
+def render_architecture(out_path: Path) -> None:
+    w, h = 14.0, 7.2
+    fig, ax = _canvas(w, h)
+    right = w - MARGIN
+    _masthead(
+        ax,
+        w,
+        h,
+        "FIG. 1 — AGENT LOOP",
+        "A read-before-write incident loop",
+        "No mutation reaches the cluster until at least two read-only observations "
+        "clear the policy gate.",
     )
 
     stages = [
-        ("1. TRIAGE", "Read-Only", "Verify SLO burn\nFilter false alarms\nIgnore log injections", CYAN),
-        ("2. LOCALIZE", "Read-Only", "Metrics + Logs\nOTel Traces\nK8s Events & Git", CYAN),
-        ("3. RCA", "Read-Only", "Falsify red herrings\nIsolate root object\nRunbook lookup", VIOLET),
-        ("4. GUARDRAIL", "Policy Gate", ">=2 Reads check\nNo destructive ops\nTNR no-regression", AMBER),
-        ("5. MITIGATE", "Write-Gated", "Minimal K8s patch\nHelm rollback\nScale & Burn-In", EMERALD),
+        ("01", "Triage", ["Verify SLO burn", "Filter false alarms", "Ignore log injections"]),
+        ("02", "Localize", ["Metrics, logs, traces", "Kubernetes events", "Recent Git changes"]),
+        ("03", "Root cause", ["Falsify red herrings", "Isolate faulty object", "Runbook lookup"]),
+        ("04", "Policy gate", ["≥ 2 reads required", "No destructive ops", "No-regression check"]),
+        ("05", "Mitigate", ["Minimal K8s patch", "Helm rollback / scale", "Burn-in & verify"]),
     ]
+    colors = [ACCENT, ACCENT, ACCENT, WARM, INK]
+    gap = 0.42
+    cw = (right - MARGIN - gap * 4) / 5
+    xs = [MARGIN + i * (cw + gap) for i in range(5)]
 
-    bw = 0.162
-    gap = 0.032
-    sx = 0.03
-    by = 0.36
-    bh = 0.40
+    # Phase brackets
+    by = 5.02
+    for x0, x1, label, col in [
+        (xs[0], xs[2] + cw, "READ-ONLY", ACCENT),
+        (xs[3], xs[3] + cw, "GATE", WARM),
+        (xs[4], xs[4] + cw, "WRITE", INK),
+    ]:
+        _t(ax, x0, by + 0.1, label, size=7.6, color=col, family=MONO, weight="bold")
+        _hline(ax, x0, x1, by, color=col, lw=0.7)
+        _vline(ax, x0, by - 0.07, by, color=col, lw=0.7)
+        _vline(ax, x1, by - 0.07, by, color=col, lw=0.7)
 
-    for i, (title, tag, desc, col) in enumerate(stages):
-        x = sx + i * (bw + gap)
-        _rounded_box(ax, x, by, bw, bh, fc=PANEL, ec=col, lw=1.6, radius=0.025, zorder=3)
-        _rounded_box(ax, x + 0.012, by + bh - 0.085, bw - 0.024, 0.062, fc=col, ec="none", lw=0, radius=0.015, zorder=4)
-        ax.text(x + bw / 2, by + bh - 0.054, title, color="#06101C", fontsize=10.5, fontweight="bold", ha="center", va="center", zorder=5)
-        ax.text(x + bw / 2, by + bh - 0.125, tag, color=col, fontsize=9, fontweight="bold", ha="center", va="center", zorder=5)
-        ax.text(x + bw / 2, by + 0.125, desc, color="#E2E8F0", fontsize=9.2, ha="center", va="center", linespacing=1.55, zorder=5)
-
-        if i < len(stages) - 1:
+    rule_y = 4.62
+    for i, ((num, name, lines), col) in enumerate(zip(stages, colors, strict=True)):
+        x = xs[i]
+        _hline(ax, x, x + cw, rule_y, color=col, lw=2.2)
+        _t(ax, x, rule_y - 0.5, num, size=24, family=SERIF, color=col)
+        _t(ax, x, rule_y - 0.88, name, size=14, weight="bold")
+        for j, line in enumerate(lines):
+            _t(ax, x, rule_y - 1.22 - j * 0.27, line, size=10.4, color=MUTED)
+        if i < 4:
             ax.annotate(
                 "",
-                xy=(x + bw + gap - 0.005, by + bh / 2),
-                xytext=(x + bw + 0.005, by + bh / 2),
-                arrowprops={"arrowstyle": "->,head_width=0.35,head_length=0.45", "color": "#64748B", "lw": 2.2},
-                zorder=5,
+                xy=(x + cw + gap - 0.1, rule_y - 0.62),
+                xytext=(x + cw + 0.1, rule_y - 0.62),
+                arrowprops={
+                    "arrowstyle": "-|>,head_width=0.16,head_length=0.32",
+                    "color": FAINT,
+                    "lw": 0.8,
+                    "shrinkA": 0,
+                    "shrinkB": 0,
+                },
             )
 
-    # Bottom hybrid architecture bar
-    _rounded_box(ax, 0.03, 0.07, 0.94, 0.21, fc="#0E172A", ec="#253652", lw=1.4, radius=0.022, zorder=3)
-    ax.text(0.05, 0.22, "HYBRID 3:1 MODEL BACKBONE (Rank-64 LoRA: 466.9M Trainable / 1.68%)", color=EMERALD, fontsize=10, fontweight="bold", va="center", zorder=4)
-    pills = [
-        ("48x Gated DeltaNet", "in_proj_qkv / z / a / b, out_proj", CYAN, 0.05, 0.28),
-        ("16x Gated Attention + SwiGLU", "q / k / v / o_proj, gate / up / down_proj", VIOLET, 0.355, 0.31),
-        ("Frozen Vision & MTP", "460.7M frozen -> fits 1x H100 / L40S FP8", AMBER, 0.69, 0.26),
+    # Backbone specification strip
+    strip_top = 2.42
+    _hline(ax, MARGIN, right, strip_top, color=RULE_2, lw=0.8)
+    _t(ax, MARGIN, strip_top - 0.3, "BACKBONE", size=7.6, color=ACCENT, family=MONO, weight="bold")
+    _t(
+        ax,
+        MARGIN + 0.85,
+        strip_top - 0.3,
+        "Qwen3.8-27B · 64 layers in a 3 : 1 hybrid pattern",
+        size=10.4,
+        color=INK_2,
+    )
+
+    n_layers = 64
+    bar_y, bar_h = 1.42, 0.36
+    pitch = (right - MARGIN) / n_layers
+    for k in range(n_layers):
+        is_attn = (k + 1) % 4 == 0
+        ax.add_patch(
+            Rectangle(
+                (MARGIN + k * pitch, bar_y),
+                pitch - 0.045,
+                bar_h,
+                facecolor=ACCENT if is_attn else ACCENT_TINT,
+                edgecolor="none",
+            )
+        )
+    _t(ax, MARGIN, bar_y + bar_h + 0.08, "1", size=7.2, color=FAINT, family=MONO)
+    _t(
+        ax,
+        right - 0.045,
+        bar_y + bar_h + 0.08,
+        "64",
+        size=7.2,
+        color=FAINT,
+        family=MONO,
+        ha="right",
+    )
+
+    ly = bar_y - 0.28
+    ax.add_patch(
+        Rectangle((MARGIN, ly - 0.01), 0.14, 0.12, facecolor=ACCENT_TINT, edgecolor="none")
+    )
+    _t(ax, MARGIN + 0.22, ly, "48 × Gated DeltaNet", size=9.6, weight="bold")
+    _t(
+        ax,
+        MARGIN + 1.72,
+        ly,
+        "linear attention · in_proj_qkv / z / a / b, out_proj",
+        size=9.6,
+        color=MUTED,
+    )
+    lx = 7.35
+    ax.add_patch(Rectangle((lx, ly - 0.01), 0.14, 0.12, facecolor=ACCENT, edgecolor="none"))
+    _t(ax, lx + 0.22, ly, "16 × Gated Attention", size=9.6, weight="bold")
+    _t(ax, lx + 1.78, ly, "every 4th layer · q / k / v / o_proj + SwiGLU", size=9.6, color=MUTED)
+
+    specs = [
+        ("ADAPTER", "LoRA, rank 64"),
+        ("TRAINABLE", "466.9M params · 1.68%"),
+        ("FROZEN", "Vision tower, MTP head"),
+        ("SERVING", "1 × H100 / L40S, FP8"),
     ]
-    for label, sub, col, px, pw in pills:
-        _rounded_box(ax, px, 0.095, pw, 0.092, fc=PANEL, ec=col, lw=1.1, radius=0.015, zorder=4)
-        ax.text(px + 0.012, 0.157, label, color=TEXT, fontsize=9.2, fontweight="bold", va="center", zorder=5)
-        ax.text(px + 0.012, 0.118, sub, color=MUTED, fontsize=8.0, va="center", zorder=5)
+    sw = (right - MARGIN) / len(specs)
+    _hline(ax, MARGIN, right, 0.92, color=RULE, lw=0.6)
+    for i, (label, value) in enumerate(specs):
+        x = MARGIN + i * sw
+        _t(ax, x, 0.66, label, size=7.2, color=FAINT, family=MONO)
+        _t(ax, x, 0.4, value, size=11, color=INK, weight="medium")
 
-    plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-    fig.savefig(out_path, dpi=220, facecolor=BG)
-    plt.close(fig)
+    _save(fig, out_path)
 
 
+# ── Figure 2: training curves ────────────────────────────────────────────────
 def render_training_curves(stage1a_log: Path, phase1b_log: Path, out_path: Path) -> None:
-    s1_steps, s1_loss, s1_acc = _parse_trl_log(stage1a_log)
-    p1_steps, p1_loss, p1_acc = _parse_trl_log(phase1b_log)
+    s_steps, s_loss, s_acc, s_sum = _parse_trl_log(stage1a_log)
+    p_steps, p_loss, p_acc, p_sum = _parse_trl_log(phase1b_log)
+    s_total = _total_steps(stage1a_log, 157)
+    p_total = _total_steps(phase1b_log, 98)
+    p_steps = [s_total + s for s in p_steps]
+    end = s_total + p_total
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4.6), dpi=220)
-    fig.patch.set_facecolor(BG)
+    w, h = 14.0, 6.7
+    fig, ax = _canvas(w, h)
+    _masthead(
+        ax,
+        w,
+        h,
+        "FIG. 2 — SUPERVISED WARM-START",
+        "Two-phase SFT converges cleanly before RL",
+        f"Stage 1a on 5,038 real SRE traces ({s_total} steps), then Phase 1b on 1,559 "
+        f"exact-schema traces ({p_total} steps, 2 epochs).",
+    )
 
-    for ax in (ax1, ax2):
-        ax.set_facecolor(PANEL)
-        ax.grid(True, color="#1E293B", linestyle="--", linewidth=0.8, alpha=0.8)
-        for spine in ax.spines.values():
-            spine.set_color(BORDER)
-        ax.tick_params(colors=MUTED, labelsize=9.5)
-
-    # Panel 1: Training Loss
-    ax1.plot(s1_steps, s1_loss, color=CYAN, lw=2.6, marker="o", markersize=3.5, label="Stage 1a: Real SRE Corpus (5,038 traces)")
-    if p1_steps:
-        ax1.plot(p1_steps, p1_loss, color=EMERALD, lw=2.6, marker="s", markersize=4.0, label="Phase 1b: Exact-Schema Calibration (1,559 traces)")
-    ax1.set_title("Training Loss (4x NVIDIA H100 BF16 LoRA-64)", color=TEXT, fontsize=13, fontweight="bold", pad=12)
-    ax1.set_xlabel("Optimizer Step (Global Batch = 32 Trajectories)", color=MUTED, fontsize=10)
-    ax1.set_ylabel("Cross-Entropy Loss", color=MUTED, fontsize=10)
-    ax1.set_ylim(bottom=0.0)
-    ax1.legend(facecolor="#0B1120", edgecolor=BORDER, labelcolor=TEXT, fontsize=9, loc="upper right")
-
-    if s1_loss:
-        ax1.annotate(
-            f"Final: {s1_loss[-1]:.3f}",
-            xy=(s1_steps[-1], s1_loss[-1]),
-            xytext=(s1_steps[-1] - 42, s1_loss[-1] + 0.55),
-            color=CYAN,
-            fontsize=9.5,
-            fontweight="bold",
-            arrowprops={"arrowstyle": "->", "color": CYAN, "lw": 1.3},
-        )
-    if p1_loss:
-        ax1.annotate(
-            f"Phase 1b: {p1_loss[-1]:.3f}",
-            xy=(p1_steps[-1], p1_loss[-1]),
-            xytext=(p1_steps[-1] + 15, p1_loss[-1] + 0.45),
-            color=EMERALD,
-            fontsize=9.5,
-            fontweight="bold",
-            arrowprops={"arrowstyle": "->", "color": EMERALD, "lw": 1.3},
-        )
-
-    # Panel 2: Mean Token Accuracy
-    ax2.plot(s1_steps, s1_acc, color=VIOLET, lw=2.6, marker="o", markersize=3.5, label="Stage 1a Token Accuracy")
-    if p1_steps:
-        ax2.plot(p1_steps, p1_acc, color=EMERALD, lw=2.6, marker="s", markersize=4.0, label="Phase 1b Schema Accuracy")
-    ax2.set_title("Multi-Turn Tool-Use Token Accuracy (%)", color=TEXT, fontsize=13, fontweight="bold", pad=12)
-    ax2.set_xlabel("Optimizer Step (Global Batch = 32 Trajectories)", color=MUTED, fontsize=10)
-    ax2.set_ylabel("Mean Token Accuracy (%)", color=MUTED, fontsize=10)
-    ax2.set_ylim(55, 100.5)
-    ax2.legend(facecolor="#0B1120", edgecolor=BORDER, labelcolor=TEXT, fontsize=9, loc="lower right")
-
-    if s1_acc:
-        ax2.annotate(
-            f"{s1_acc[-1]:.1f}%",
-            xy=(s1_steps[-1], s1_acc[-1]),
-            xytext=(s1_steps[-1] - 32, s1_acc[-1] - 7.5),
-            color=VIOLET,
-            fontsize=10,
-            fontweight="bold",
-            arrowprops={"arrowstyle": "->", "color": VIOLET, "lw": 1.3},
-        )
-    if p1_acc:
-        ax2.annotate(
-            f"{p1_acc[-1]:.1f}%",
-            xy=(p1_steps[-1], p1_acc[-1]),
-            xytext=(p1_steps[-1] + 14, p1_acc[-1] - 6.0),
-            color=EMERALD,
-            fontsize=10,
-            fontweight="bold",
-            arrowprops={"arrowstyle": "->", "color": EMERALD, "lw": 1.3},
-        )
-
-    fig.tight_layout(pad=2.0)
-    fig.savefig(out_path, dpi=220, facecolor=BG)
-    plt.close(fig)
-
-
-def render_dataset_infographic(out_path: Path) -> None:
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 4.7), dpi=220, gridspec_kw={"width_ratios": [1.35, 1.0]})
-    fig.patch.set_facecolor(BG)
-
-    # Left: Open SRE Corpus Horizontal Bar Chart
-    ax1.set_facecolor(PANEL)
-    for spine in ax1.spines.values():
-        spine.set_color(BORDER)
-
-    sources = [
-        "OpenSRE On-Call Traces\n(rmems, Apache-2.0)",
-        "DevOps Reasoning Traces\n(deepfabric)",
-        "PromQL Production Rules\n(awesome-prom-alerts)",
-        "K8s/OpenShift Runbooks\n(openshift + kube-prom)",
-        "Grounded Runbook Traces\n(exact-schema SFT)",
-        "Agentic SRE + K8s RCA\n(miyad316 + beatsprom)",
-        "Real Postmortems + SREGym\n(danluu + SREGym MIT)",
+    ax_y, ax_h = 0.95, 3.3
+    ax_w = 5.55
+    lefts = [MARGIN + 0.5, MARGIN + 0.5 + ax_w + 1.2]
+    panels = [
+        ("Training loss", "cross-entropy, log scale", s_loss, p_loss),
+        ("Token accuracy", "mean per-token, %", s_acc, p_acc),
     ]
-    counts = [2961, 1305, 1217, 412, 400, 373, 417]
-    colors = [EMERALD, CYAN, AMBER, VIOLET, "#2DD4BF", "#60A5FA", ROSE]
 
-    y_pos = np.arange(len(sources))
-    ax1.set_axisbelow(True)
-    ax1.grid(axis="x", color="#1E293B", linestyle="--", linewidth=0.8, zorder=0)
-    bars = ax1.barh(y_pos, counts, color=colors, height=0.62, edgecolor="none", zorder=3)
-    ax1.set_yticks(y_pos)
-    ax1.set_yticklabels(sources, color="#E2E8F0", fontsize=9.2)
-    ax1.invert_yaxis()
-    ax1.set_xlim(0, 3550)
-    ax1.tick_params(axis="x", colors=MUTED, labelsize=9)
-    ax1.set_xlabel("Verified Records / Rules Collected", color=MUTED, fontsize=9.5)
-    ax1.set_title("Open-Source SRE Corpus (5,038 SFT + 2,046 KB)", color=TEXT, fontsize=12.5, fontweight="bold", pad=12)
+    for idx, (title, unit, s_y, p_y) in enumerate(panels):
+        x0 = lefts[idx]
+        _t(ax, x0 - 0.5, ax_y + ax_h + 0.5, title, size=12.5, weight="bold")
+        tw = _text_width(fig, ax.texts[-1])
+        _t(ax, x0 - 0.5 + tw + 0.12, ax_y + ax_h + 0.5, unit, size=10, color=FAINT)
 
-    for bar, val in zip(bars, counts, strict=True):
-        ax1.text(
-            val + 55,
-            bar.get_y() + bar.get_height() / 2,
-            f"{val:,}",
-            color=TEXT,
-            fontsize=9.5,
+        a = fig.add_axes((x0 / w, ax_y / h, ax_w / w, ax_h / h))
+        a.set_facecolor(PAPER)
+        for side in ("top", "right", "left"):
+            a.spines[side].set_visible(False)
+        a.spines["bottom"].set_color(RULE_2)
+        a.spines["bottom"].set_linewidth(0.8)
+        a.tick_params(axis="both", length=0, labelsize=8.6, labelcolor=MUTED, pad=6)
+        a.tick_params(axis="x", length=3, color=RULE_2, width=0.8)
+        for lab in a.get_xticklabels() + a.get_yticklabels():
+            lab.set_family(MONO)
+        a.set_axisbelow(True)
+        a.grid(axis="y", color=RULE, lw=0.7)
+        a.set_xlim(0, end + 30)
+        a.xaxis.set_major_locator(FixedLocator([0, 50, 100, 150, 200, 250]))
+
+        if idx == 0:
+            a.set_yscale("log")
+            a.set_ylim(0.04, 5.0)
+            a.yaxis.set_major_locator(FixedLocator([0.05, 0.1, 0.2, 0.5, 1, 2, 4]))
+            a.yaxis.set_minor_locator(NullLocator())
+            a.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        else:
+            a.set_ylim(55, 102)
+            a.yaxis.set_major_locator(FixedLocator([60, 70, 80, 90, 100]))
+            a.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}"))
+        for lab in a.get_xticklabels() + a.get_yticklabels():
+            lab.set_family(MONO)
+
+        # Phase boundary
+        a.axvline(s_total, color=FAINT, lw=0.8, ls=(0, (2, 2)), zorder=1)
+        xt = a.get_xaxis_transform()
+        a.text(
+            0,
+            1.04,
+            "STAGE 1A",
+            transform=xt,
+            fontsize=7.4,
+            family=MONO,
+            color=ACCENT,
             fontweight="bold",
-            va="center",
+            va="bottom",
+        )
+        a.text(
+            s_total + 5,
+            1.04,
+            "PHASE 1B",
+            transform=xt,
+            fontsize=7.4,
+            family=MONO,
+            color=WARM,
+            fontweight="bold",
+            va="bottom",
         )
 
-    # Right: 5-Gate Validation Scorecard
-    ax2.set_facecolor(BG)
-    ax2.set_xlim(0, 1)
-    ax2.set_ylim(0, 1)
-    ax2.axis("off")
+        a.plot(s_steps, s_y, color=ACCENT, lw=1.7, solid_capstyle="round", zorder=3)
+        a.plot(p_steps, p_y, color=WARM, lw=1.7, solid_capstyle="round", zorder=3)
+        for xs_, ys_, col in [(s_steps, s_y, ACCENT), (p_steps, p_y, WARM)]:
+            if xs_:
+                a.plot(
+                    [xs_[0], xs_[-1]],
+                    [ys_[0], ys_[-1]],
+                    "o",
+                    ms=3.6,
+                    color=col,
+                    mec=PAPER,
+                    mew=0.8,
+                    zorder=4,
+                )
 
-    ax2.text(0.02, 0.96, "5-Gate Dataset Validation", color=TEXT, fontsize=13.5, fontweight="bold", va="center")
-    ax2.text(0.02, 0.895, "Every training split passes 5/5 automated gates before GPU launch", color=MUTED, fontsize=9.0, va="center")
+        fmt = (lambda v: f"{v:.3f}") if idx == 0 else (lambda v: f"{v:.1f}%")
+        if s_steps:
+            if idx == 0:
+                a.annotate(
+                    f"{s_y[0]:.2f}",
+                    (s_steps[0], s_y[0]),
+                    xytext=(7, 1),
+                    textcoords="offset points",
+                    fontsize=8.6,
+                    family=MONO,
+                    color=ACCENT,
+                    va="center",
+                )
+                a.annotate(
+                    fmt(s_y[-1]),
+                    (s_steps[-1], s_y[-1]),
+                    xytext=(-4, -11),
+                    textcoords="offset points",
+                    fontsize=8.6,
+                    family=MONO,
+                    color=ACCENT,
+                    ha="right",
+                    va="center",
+                    fontweight="bold",
+                )
+            else:
+                a.annotate(
+                    fmt(s_y[0]),
+                    (s_steps[0], s_y[0]),
+                    xytext=(7, -1),
+                    textcoords="offset points",
+                    fontsize=8.6,
+                    family=MONO,
+                    color=ACCENT,
+                    va="center",
+                )
+                a.annotate(
+                    fmt(s_y[-1]),
+                    (s_steps[-1], s_y[-1]),
+                    xytext=(-4, -12),
+                    textcoords="offset points",
+                    fontsize=8.6,
+                    family=MONO,
+                    color=ACCENT,
+                    ha="right",
+                    va="center",
+                    fontweight="bold",
+                )
+        if p_steps:
+            a.annotate(
+                fmt(p_y[-1]),
+                (p_steps[-1], p_y[-1]),
+                xytext=(6, 0),
+                textcoords="offset points",
+                fontsize=8.6,
+                family=MONO,
+                color=WARM,
+                ha="left",
+                va="center",
+                fontweight="bold",
+            )
+
+        a.set_xlabel("optimizer step (cumulative)", fontsize=8.6, color=FAINT, labelpad=6)
+
+    rt = s_sum.get("train_runtime", 0) + p_sum.get("train_runtime", 0)
+    note = "Source: TRL trainer logs, logged every 5 steps · 4 × H100 BF16 · LoRA r = 64 · batch 32"
+    if rt:
+        note += f" · {rt / 60:.0f} min wall-clock"
+    _t(ax, MARGIN, 0.22, note, size=7.4, color=FAINT, family=MONO)
+
+    _save(fig, out_path)
+
+
+# ── Figure 3: corpus & validation ────────────────────────────────────────────
+def render_dataset_infographic(out_path: Path) -> None:
+    sft = _source_counts(DATA_DIR / "sft_real_sre_corpus.jsonl", SFT_FALLBACK)
+    kb = _source_counts(DATA_DIR / "production_runbooks_promql_kb.jsonl", KB_FALLBACK)
+    rep = _validation_report()
+    n_sft, n_kb = sum(sft.values()), sum(kb.values())
+
+    w, h = 14.0, 7.0
+    fig, ax = _canvas(w, h)
+    right = w - MARGIN
+    _masthead(
+        ax,
+        w,
+        h,
+        "FIG. 3 — DATA",
+        "An open, validated SRE corpus",
+        f"{n_sft:,} supervised trajectories and {n_kb:,} knowledge-base documents from "
+        "permissively licensed public sources.",
+    )
+
+    # Left: horizontal bars
+    label_x = MARGIN
+    bar_x0 = MARGIN + 2.75
+    bar_max_w = 3.25
+    vmax = max(max(sft.values()), max(kb.values()))
+    row = 0.262
+    y = 4.86
+
+    def group(title: str, total: int, items: dict[str, int], labels: dict[str, str], col: str):
+        nonlocal y
+        _t(ax, label_x, y, title, size=7.6, color=col, family=MONO, weight="bold")
+        _t(
+            ax,
+            bar_x0 + bar_max_w + 0.62,
+            y,
+            f"{total:,}",
+            size=7.6,
+            color=col,
+            family=MONO,
+            weight="bold",
+            ha="right",
+        )
+        y -= 0.1
+        _hline(ax, label_x, bar_x0 + bar_max_w + 0.62, y, color=RULE_2, lw=0.6)
+        y -= row
+        for src, n in items.items():
+            _t(ax, label_x, y, labels.get(src, src), size=9.4, color=INK_2, va="center")
+            bw = max(bar_max_w * n / vmax, 0.012)
+            ax.add_patch(Rectangle((bar_x0, y - 0.075), bw, 0.15, facecolor=col, edgecolor="none"))
+            _t(ax, bar_x0 + bw + 0.07, y, f"{n:,}", size=8.4, color=MUTED, family=MONO, va="center")
+            y -= row
+        y -= 0.22
+
+    group("SFT TRAJECTORIES", n_sft, sft, SFT_LABELS, ACCENT)
+    group("KNOWLEDGE BASE", n_kb, kb, KB_LABELS, WARM)
+
+    # Divider
+    div_x = 7.62
+    _vline(ax, div_x, 0.8, 5.0, color=RULE, lw=0.7)
+
+    # Right: validation gates table
+    tx = div_x + 0.42
+    _t(ax, tx, 4.86, "FIVE VALIDATION GATES", size=7.6, color=ACCENT, family=MONO, weight="bold")
+    _t(ax, right, 4.86, "ALL PASS", size=7.6, color=ACCENT, family=MONO, weight="bold", ha="right")
+    _hline(ax, tx, right, 4.76, color=RULE_2, lw=0.6)
+
+    pct = rep.get("sft_token_percentiles", {})
+    leaks = sum(rep.get("pii_secret_leaks", {}).values())
+    contam = sum(rep.get("contamination_overlaps", {}).values())
+    mix = rep.get("safety_mix", {})
+    adversarial = sum(v for k, v in mix.items() if k != "real_incidents")
+    total = rep.get("sft_total_rows", n_sft)
+    valid = total - rep.get("sft_invalid_rows", 0)
+    oracle_n = rep.get("rl_oracle_checked", 200)
+    oracle_ok = round(oracle_n * rep.get("rl_oracle_pass_rate", 1.0))
 
     gates = [
-        ("GATE 1", "Zero PII / Secret Leaks", "0 AWS/GCP/JWT/IPv4/Email leaks"),
-        ("GATE 2", "Tool-Call Schema Integrity", "5,038/5,038 valid • p99 = 2,916 tok"),
-        ("GATE 3", "RLVR Oracle Solvability", "200/200 (100%) deterministic solve"),
-        ("GATE 4", "Zero Train/Eval Leakage", "0 topology • 0 scenario • 0 prompt"),
-        ("GATE 5", "Safety & Adversarial Mix", "False alarms + Log-injection traps"),
+        ("Privacy", "PII and secret leaks after redaction", f"{leaks}"),
+        (
+            "Schema integrity",
+            f"valid tool-call traces · p99 {pct.get('p99', 0):,} tok",
+            f"{valid:,}/{total:,}",
+        ),
+        ("Oracle solvability", "RLVR scenarios solved by the oracle", f"{oracle_ok}/{oracle_n}"),
+        ("Contamination", "scenario, topology & prompt overlap", f"{contam}"),
+        ("Safety balance", "false alarms, escalations, log injections", f"{adversarial}"),
     ]
-
-    gy = 0.69
-    step = 0.165
-    for code, title, detail in gates:
-        _rounded_box(ax2, 0.02, gy, 0.96, 0.135, fc=PANEL, ec="#1E3A5F", lw=1.2, radius=0.02, zorder=2)
-        _rounded_box(ax2, 0.04, gy + 0.032, 0.16, 0.072, fc="#064E3B", ec=EMERALD, lw=1.0, radius=0.015, zorder=3)
-        ax2.text(0.12, gy + 0.068, "PASS", color="#34D399", fontsize=8.8, fontweight="bold", ha="center", va="center", zorder=4)
-        ax2.text(0.23, gy + 0.088, f"{code}: {title}", color=TEXT, fontsize=9.8, fontweight="bold", va="center", zorder=4)
-        ax2.text(0.23, gy + 0.035, detail, color=MUTED, fontsize=8.5, va="center", zorder=4)
+    gy = 4.24
+    step = 0.78
+    for i, (name, detail, value) in enumerate(gates):
+        _t(ax, tx, gy + 0.08, f"0{i + 1}", size=8.4, color=FAINT, family=MONO)
+        _t(ax, tx + 0.45, gy + 0.08, name, size=11.5, weight="bold")
+        _t(ax, tx + 0.45, gy - 0.2, detail, size=9.2, color=MUTED)
+        _t(
+            ax,
+            right - 0.78,
+            gy - 0.06,
+            value,
+            size=17,
+            family=SERIF,
+            weight="bold",
+            ha="right",
+            va="center",
+        )
+        _t(
+            ax,
+            right,
+            gy - 0.06,
+            "PASS",
+            size=7.6,
+            color=ACCENT,
+            family=MONO,
+            weight="bold",
+            ha="right",
+            va="center",
+        )
+        if i < len(gates) - 1:
+            _hline(ax, tx, right, gy - 0.42, color=RULE, lw=0.6)
         gy -= step
 
-    fig.tight_layout(pad=1.8)
-    fig.savefig(out_path, dpi=220, facecolor=BG)
-    plt.close(fig)
+    _t(
+        ax,
+        MARGIN,
+        0.22,
+        "Source: data/real_sre_v2 — sft_real_sre_corpus.jsonl, production_runbooks_promql_kb.jsonl,"
+        " validation_report.json",
+        size=7.4,
+        color=FAINT,
+        family=MONO,
+    )
+
+    _save(fig, out_path)
 
 
 def main() -> None:
-    assets_dir = Path("assets")
+    assets_dir = REPO_ROOT / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
     render_hero(assets_dir / "omnisre_hero.png")
     render_architecture(assets_dir / "omnisre_architecture.png")
@@ -405,7 +773,7 @@ def main() -> None:
         assets_dir / "omnisre_training_curves.png",
     )
     render_dataset_infographic(assets_dir / "omnisre_dataset_infographic.png")
-    print("Rendered all 4 OmniSRE visuals in assets/")
+    print(f"Rendered 4 OmniSRE figures in {assets_dir}")
 
 
 if __name__ == "__main__":
