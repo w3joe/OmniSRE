@@ -33,7 +33,7 @@ stop_sglang() {
 trap stop_sglang EXIT
 
 echo "=== [v1.0 1/4] Preparing Real Telemetry + Tier-1 Write-Remediation Corpora ==="
-mkdir -p "${NVME_ROOT}/real_telemetry/raw" "${NVME_ROOT}/real_telemetry/extracted" "${NVME_ROOT}/real_telemetry/index" "${NVME_ROOT}/data_phase1b"
+mkdir -p "${NVME_ROOT}/real_telemetry/raw" "${NVME_ROOT}/real_telemetry/extracted" "${NVME_ROOT}/real_telemetry/index" "${NVME_ROOT}/data_v2"
 if [[ ! -d "${NVME_ROOT}/real_telemetry/extracted/DejaVu-C" ]]; then
   gcloud storage rsync -r "${GCS_BUCKET}/real-telemetry-raw" "${NVME_ROOT}/real_telemetry/raw" --quiet
 fi
@@ -42,8 +42,9 @@ fi
   --extracted-dir "${NVME_ROOT}/real_telemetry/extracted" \
   --out-dir "${NVME_ROOT}/real_telemetry/index"
 
-if [[ ! -f "${NVME_ROOT}/data_phase1b/rlvr_scenarios_train.json" ]]; then
-  gcloud storage rsync -r "${GCS_BUCKET}/dataset-v4-phase1b" "${NVME_ROOT}/data_phase1b" --quiet
+if [[ ! -f "${NVME_ROOT}/data_v2/rl_real_train.jsonl" ]]; then
+  gcloud storage cp "${GCS_BUCKET}/dataset-v2-validated/rl_real_train.jsonl" "${NVME_ROOT}/data_v2/rl_real_train.jsonl" --quiet
+  gcloud storage cp "${GCS_BUCKET}/dataset-v2-validated/rl_real_heldout.jsonl" "${NVME_ROOT}/data_v2/rl_real_heldout.jsonl" --quiet
 fi
 
 if [[ "${ENABLE_OPENRCA}" == "1" ]]; then
@@ -103,8 +104,8 @@ CUDA_VISIBLE_DEVICES=2,3 /mnt/nvme/venv-sre-rl/bin/torchrun --nproc_per_node=2 -
   --heldout-index-jsonl "${NVME_ROOT}/real_telemetry/index/real_telemetry_heldout.jsonl" \
   --openrca-train-jsonl "${NVME_ROOT}/real_telemetry/index/openrca_train.jsonl" \
   --openrca-heldout-jsonl "${NVME_ROOT}/real_telemetry/index/openrca_heldout.jsonl" \
-  --tier1-train-json "${NVME_ROOT}/data_phase1b/rlvr_scenarios_train.json" \
-  --tier1-heldout-json "${NVME_ROOT}/data_phase1b/rlvr_scenarios_heldout.json" \
+  --tier1-train-json "${NVME_ROOT}/data_v2/rl_real_train.jsonl" \
+  --tier1-heldout-json "${NVME_ROOT}/data_v2/rl_real_heldout.jsonl" \
   --kind-lease-dir "${NVME_ROOT}/kind-leases" \
   --steps "${STEPS}" \
   --prompts-per-step 8 \

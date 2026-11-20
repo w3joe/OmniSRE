@@ -577,6 +577,29 @@ def _gcs_rsync(local_dir: Path, gcs_dest: str) -> None:
     subprocess.run(["gcloud", "storage", "rsync", "-r", str(local_dir), gcs_dest, "--quiet"], check=False)
 
 
+def _load_tier1_scenarios(path: Path) -> list[IncidentScenario]:
+    """Load Tier-1 write-remediation scenarios from either VERL JSONL or raw JSON list."""
+    if not path.exists():
+        return []
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        return []
+    if path.suffix == ".json" and text.startswith("["):
+        return [IncidentScenario.model_validate(item) for item in json.loads(text)]
+    rows: list[IncidentScenario] = []
+    for ln in text.splitlines():
+        if not ln.strip():
+            continue
+        obj = json.loads(ln)
+        gt = obj["reward_model"]["ground_truth"] if "reward_model" in obj else obj
+        rows.append(
+            IncidentScenario.model_validate_json(gt)
+            if isinstance(gt, str)
+            else IncidentScenario.model_validate(gt)
+        )
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="OmniSRE v1.0 Flagship Multi-World RLVR Trainer")
     parser.add_argument("--base-model-path", type=str, required=True)
@@ -587,8 +610,8 @@ def main() -> None:
     parser.add_argument("--heldout-index-jsonl", type=Path, default=Path("/mnt/nvme/real_telemetry/index/real_telemetry_heldout.jsonl"))
     parser.add_argument("--openrca-train-jsonl", type=Path, default=Path("/mnt/nvme/real_telemetry/index/openrca_train.jsonl"))
     parser.add_argument("--openrca-heldout-jsonl", type=Path, default=Path("/mnt/nvme/real_telemetry/index/openrca_heldout.jsonl"))
-    parser.add_argument("--tier1-train-json", type=Path, default=Path("/mnt/nvme/data_phase1b/rlvr_scenarios_train.json"))
-    parser.add_argument("--tier1-heldout-json", type=Path, default=Path("/mnt/nvme/data_phase1b/rlvr_scenarios_heldout.json"))
+    parser.add_argument("--tier1-train-json", type=Path, default=Path("/mnt/nvme/data_v2/rl_real_train.jsonl"))
+    parser.add_argument("--tier1-heldout-json", type=Path, default=Path("/mnt/nvme/data_v2/rl_real_heldout.jsonl"))
     parser.add_argument("--kind-lease-dir", type=Path, default=Path("/mnt/nvme/kind-leases"))
     parser.add_argument("--steps", type=int, default=250)
     parser.add_argument("--prompts-per-step", type=int, default=8)
@@ -647,12 +670,8 @@ def main() -> None:
         heldout_records.extend(openrca_ho)
 
     # Load optional Tier-1 write-remediation & live Kind K8s cluster pool
-    tier1_train: list[IncidentScenario] = []
-    tier1_heldout: list[IncidentScenario] = []
-    if args.tier1_train_json.exists():
-        tier1_train = [IncidentScenario.model_validate(x) for x in json.loads(args.tier1_train_json.read_text())]
-    if args.tier1_heldout_json.exists():
-        tier1_heldout = [IncidentScenario.model_validate(x) for x in json.loads(args.tier1_heldout_json.read_text())]
+    tier1_train = _load_tier1_scenarios(args.tier1_train_json)
+    tier1_heldout = _load_tier1_scenarios(args.tier1_heldout_json)
     kind_pool = KindClusterLeasePool(args.kind_lease_dir)
 
     rng = random.Random(args.seed)
