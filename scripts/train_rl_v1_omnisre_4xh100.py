@@ -945,14 +945,14 @@ def main() -> None:
             with sync_ctx:
                 new_lp, _ = _compute_masked_logprobs_fp32_head(ddp_model, input_ids, mask_t)
                 loss, _ = compute_masked_cispo_loss_torch(
-                    new_logprobs=new_lp,
-                    old_logprobs=old_lp.detach(),
-                    advantages=adv_t[active_pos],
-                    action_mask=torch.ones_like(new_lp),
+                    new_lp,
+                    old_lp.detach(),
+                    adv_t[active_pos],
                 )
                 (loss / denom).backward()
                 loss_accum += float(loss.item()) / denom
             del input_ids, adv_t, mask_t, old_lp, new_lp, loss
+            torch.cuda.empty_cache()
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_([p for p in ddp_model.parameters() if p.requires_grad], 1.0))
         optimizer.step()

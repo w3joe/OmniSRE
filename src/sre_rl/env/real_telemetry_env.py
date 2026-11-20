@@ -278,6 +278,7 @@ class _LoadedMetricsCache:
 # Process-wide thread-safe caches so 24 concurrent rollout threads NEVER re-parse
 # 75 MB DejaVu CSVs or re-scan identical Prometheus files across G=8 group rollouts!
 _CACHE_LOCK = threading.Lock()
+_DEJAVU_FILE_LOCKS: dict[str, threading.Lock] = {}
 _DEJAVU_RAW_TABLE_CACHE: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
 _CASE_SUMMARY_CACHE: dict[tuple[str, int, int, int, str], _LoadedMetricsCache] = {}
 _CACHE_STATS: dict[str, int] = {"dejavu_file_parses": 0, "case_cache_hits": 0}
@@ -476,37 +477,44 @@ class RealTelemetryReplayEnvironment:
             existing = _DEJAVU_RAW_TABLE_CACHE.get(key)
             if existing is not None:
                 return existing
+            file_lock = _DEJAVU_FILE_LOCKS.setdefault(key, threading.Lock())
 
-        # Parse once per CSV file into sorted (timestamps_int64, values_float32) arrays
-        raw_ts: dict[str, list[int]] = {}
-        raw_vals: dict[str, list[float]] = {}
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            reader = csv.DictReader(fh)
-            for row in reader:
-                try:
-                    ts = int(float(row["timestamp"]))
-                    val = float(row["value"])
-                except (KeyError, ValueError):
-                    continue
-                if not np.isfinite(val):
-                    continue
-                name = str(row.get("name", "")).strip()
-                if not name:
-                    continue
-                raw_ts.setdefault(name, []).append(ts)
-                raw_vals.setdefault(name, []).append(val)
+        with file_lock:
+            with _CACHE_LOCK:
+                existing = _DEJAVU_RAW_TABLE_CACHE.get(key)
+                if existing is not None:
+                    return existing
 
-        indexed: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for name, ts_list in raw_ts.items():
-            ts_arr = np.array(ts_list, dtype=np.int64)
-            v_arr = np.array(raw_vals[name], dtype=np.float32)
-            order = np.argsort(ts_arr)
-            indexed[name] = (ts_arr[order], v_arr[order])
+            # Parse strictly ONCE per CSV file into sorted (timestamps_int64, values_float32) arrays
+            raw_ts: dict[str, list[int]] = {}
+            raw_vals: dict[str, list[float]] = {}
+            with path.open("r", encoding="utf-8", errors="ignore") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    try:
+                        ts = int(float(row["timestamp"]))
+                        val = float(row["value"])
+                    except (KeyError, ValueError):
+                        continue
+                    if not np.isfinite(val):
+                        continue
+                    name = str(row.get("name", "")).strip()
+                    if not name:
+                        continue
+                    raw_ts.setdefault(name, []).append(ts)
+                    raw_vals.setdefault(name, []).append(val)
 
-        with _CACHE_LOCK:
-            _DEJAVU_RAW_TABLE_CACHE[key] = indexed
-            _CACHE_STATS["dejavu_file_parses"] += 1
-        return indexed
+            indexed: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+            for name, ts_list in raw_ts.items():
+                ts_arr = np.array(ts_list, dtype=np.int64)
+                v_arr = np.array(raw_vals[name], dtype=np.float32)
+                order = np.argsort(ts_arr)
+                indexed[name] = (ts_arr[order], v_arr[order])
+
+            with _CACHE_LOCK:
+                _DEJAVU_RAW_TABLE_CACHE[key] = indexed
+                _CACHE_STATS["dejavu_file_parses"] += 1
+            return indexed
 
     @classmethod
     def _load_dejavu_long_metrics(
