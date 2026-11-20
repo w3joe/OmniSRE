@@ -292,7 +292,10 @@ def _compute_masked_logprobs_fp32_head(
         return torch.zeros(0, device=input_ids.device, dtype=torch.float32), active_target_pos
 
     pred_positions = active_target_pos - 1
-    logits = model(input_ids=input_ids, use_cache=False, logits_to_keep=pred_positions).logits
+    # Run backbone forward/backward in BF16 (saves ~10 GB activation VRAM while keeping
+    # FP32 LoRA master weights, FP32 gradient accumulation, FP32 optimizer & FP32 softmax!)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits = model(input_ids=input_ids, use_cache=False, logits_to_keep=pred_positions).logits
     target_ids = input_ids[0, active_target_pos]
     chunks: list[torch.Tensor] = []
     for start in range(0, active_target_pos.numel(), chunk_size):
@@ -538,7 +541,7 @@ def main() -> None:
                 stats = [t[2] for t in traces]
                 advs, masks = compute_gtpo_hybrid_advantages(items, config=dapo_cfg)
                 for idx, tr in enumerate(traces):
-                    seq_t = tr[0][:7168]
+                    seq_t = tr[0][:6144]
                     adv_t_np = advs[idx][: len(seq_t)]
                     mask_t_np = masks[idx][: len(seq_t)]
                     if float(np.sum(mask_t_np[1:])) > 0.0 and len(seq_t) > 2:
