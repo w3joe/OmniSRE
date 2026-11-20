@@ -100,7 +100,7 @@ tags:
 finds root cause and remediates, and it never writes before it reads.
 
 {artifact} · `{stage_label}` · Apache 2.0 · \
-[Code & training pipeline](https://github.com/w3joe/qwen38-sre-rl)
+[Code & training pipeline](https://github.com/w3joe/OmniSRE)
 
 <br/>
 
