@@ -72,7 +72,7 @@ def main() -> None:
     import torch
     from datasets import Dataset
     from peft import LoraConfig, PeftModel, get_peft_model
-    from transformers import AutoModelForImageTextToText, AutoTokenizer
+    from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
     model_id = cfg["model"]["model_name_or_path"]
@@ -169,14 +169,23 @@ def main() -> None:
     trainer.train()
     trainer.save_model(out_dir)
 
-    # 4. Merge LoRA into BF16 base checkpoint on rank 0 for Stage 2 veRL initialization
+    # 4. Merge LoRA into BF16 base checkpoint on rank 0 for Stage 2 SGLang/veRL initialization
+    trainer.accelerator.wait_for_everyone()
     if not args.skip_merge and trainer.accelerator.is_main_process:
         print(f"[sft] Merging LoRA adapter into {args.merge_output_dir} for Stage 2 RLVR...")
-        merged = model.merge_and_unload()
+        unwrapped = trainer.accelerator.unwrap_model(trainer.model)
+        merged = unwrapped.merge_and_unload()
         args.merge_output_dir.mkdir(parents=True, exist_ok=True)
         merged.save_pretrained(args.merge_output_dir, safe_serialization=True)
         tokenizer.save_pretrained(args.merge_output_dir)
+        # Save multimodal processor config so SGLang/vLLM can load Qwen3_5ForConditionalGeneration cleanly
+        try:
+            processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+            processor.save_pretrained(args.merge_output_dir)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[sft] Warning: AutoProcessor save skipped ({exc})")
         print("[sft] Merged checkpoint saved.")
+    trainer.accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

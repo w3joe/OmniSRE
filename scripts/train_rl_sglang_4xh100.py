@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import json
 import os
 import random
+import shutil
 import time
 import urllib.request
 from pathlib import Path
@@ -92,7 +94,11 @@ def rollout_episode_via_sglang(
     chat_url = f"{sglang_base_url.rstrip('/')}/v1/chat/completions"
 
     for _ in range(max_turns):
-        fmt_msgs = format_multiturn_preserve_thinking(messages, preserve_thinking=True)
+        # Preserve ALL prior thoughts during RL rollout construction so token offsets
+        # in `turn_spans` remain 100% bit-exact against final `full_ids` across all turns.
+        fmt_msgs = format_multiturn_preserve_thinking(
+            messages, preserve_thinking=True, keep_last_k_thoughts=max_turns
+        )
         prompt_ids = _chat_template_ids(tokenizer, fmt_msgs, add_generation_prompt=True)
         if len(prompt_ids) >= max_seq_len - max_new_tokens:
             break
@@ -115,19 +121,28 @@ def rollout_episode_via_sglang(
             assistant_text = f"<think>{reasoning}</think>\n{content}"
         else:
             assistant_text = content
-
-        gen_ids = tokenizer.encode(assistant_text, add_special_tokens=False)
-        if not gen_ids:
+        if not assistant_text.strip():
             break
 
         outcome = env.step(assistant_text)
+        messages.append({"role": "assistant", "content": assistant_text})
+
+        # Compute exact token span directly from ChatML template prefix diff (zero drift!)
+        after_assistant_ids = _chat_template_ids(
+            tokenizer,
+            format_multiturn_preserve_thinking(
+                messages, preserve_thinking=True, keep_last_k_thoughts=max_turns
+            ),
+            add_generation_prompt=False,
+        )
         start_pos = len(prompt_ids)
-        full_ids = prompt_ids + gen_ids
-        end_pos = len(full_ids)
+        end_pos = len(after_assistant_ids)
+        if end_pos <= start_pos:
+            break
+        full_ids = after_assistant_ids
         turn_spans.append((start_pos, end_pos))
         turn_rewards.append(float(outcome.step_shaping_reward))
 
-        messages.append({"role": "assistant", "content": assistant_text})
         messages.append(
             {"role": "user", "content": f"<tool_response>\n{outcome.observation}\n</tool_response>"}
         )
@@ -178,22 +193,43 @@ def sync_lora_weights_to_sglang(
     tokenizer,
     sglang_base_url: str,
     sync_dir: Path,
+    base_model_path: str,
 ) -> float:
-    """Merge current LoRA weights temporarily, save to NVMe RAID-0, and hot-reload SGLang."""
+    """Atomically export merged BF16 weights to NVMe RAID-0 and hot-reload SGLang."""
     t0 = time.time()
-    sync_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = sync_dir.parent / f"{sync_dir.name}.tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    was_training = peft_model.training
+    peft_model.eval()
     peft_model.merge_adapter()
     try:
-        peft_model.base_model.model.save_pretrained(sync_dir, safe_serialization=True)
-        tokenizer.save_pretrained(sync_dir)
+        peft_model.base_model.model.save_pretrained(tmp_dir, safe_serialization=True)
+        tokenizer.save_pretrained(tmp_dir)
+        # Preserve multimodal preprocessor JSONs if present in base_model_path
+        src_base = Path(base_model_path)
+        if src_base.is_dir():
+            for fname in ("preprocessor_config.json", "video_preprocessor_config.json"):
+                if (src_base / fname).exists():
+                    shutil.copy2(src_base / fname, tmp_dir / fname)
     finally:
         peft_model.unmerge_adapter()
+        if was_training:
+            peft_model.train()
 
-    _post_json(
+    if sync_dir.exists():
+        shutil.rmtree(sync_dir)
+    tmp_dir.rename(sync_dir)
+
+    resp = _post_json(
         f"{sglang_base_url.rstrip('/')}/update_weights_from_disk",
         {"model_path": str(sync_dir)},
         timeout=180,
     )
+    if isinstance(resp, dict) and resp.get("success") is False:
+        raise RuntimeError(f"SGLang weight sync failed: {resp}")
     return time.time() - t0
 
 
@@ -338,13 +374,17 @@ def main() -> None:
             all_safe: list[float] = []
             all_turns: list[float] = []
 
-            while accepted_groups < args.prompts_per_step:
-                # Launch 2x candidate scenarios in parallel to absorb DAPO group filtering cleanly
+            max_attempts_this_step = args.prompts_per_step * 5
+            attempts_this_step = 0
+
+            while accepted_groups < args.prompts_per_step and attempts_this_step < max_attempts_this_step:
+                needed = args.prompts_per_step - accepted_groups
                 batch_sc = [
                     train_scenarios[(cursor + j) % len(train_scenarios)]
-                    for j in range(args.prompts_per_step - accepted_groups)
+                    for j in range(needed)
                 ]
                 cursor += len(batch_sc)
+                attempts_this_step += len(batch_sc)
 
                 jobs = [(sc_i, sc) for sc_i, sc in enumerate(batch_sc) for _ in range(args.group_size)]
                 grouped: dict[int, list[tuple[list[int], RolloutGroupItem, dict[str, float]]]] = {
@@ -385,60 +425,74 @@ def main() -> None:
 
                     advs, masks = compute_gtpo_hybrid_advantages(items, config=dapo_cfg)
                     for idx, tr in enumerate(traces):
-                        payload_for_ranks.append((tr[0], advs[idx], masks[idx]))
+                        # Pre-filter empty-mask rollouts BEFORE broadcast so every DDP rank
+                        # executes the EXACT same number of backward passes (zero NCCL deadlock!)
+                        if float(np.sum(masks[idx][1:])) > 0.0 and len(tr[0]) > 2:
+                            payload_for_ranks.append((tr[0], advs[idx], masks[idx]))
                     all_rewards.extend(rew.tolist())
                     all_mit.extend(s["mitigated"] for s in stats)
                     all_safe.extend(s["safety_violated"] for s in stats)
                     all_turns.extend(s["turns"] for s in stats)
                     accepted_groups += 1
 
-            step_metrics = {
-                "rl_step": step,
-                "trajectories": len(payload_for_ranks),
-                "batch_mean_reward": round(float(np.mean(all_rewards)), 4),
-                "batch_max_reward": round(float(np.max(all_rewards)), 4),
-                "mitigation_rate": round(float(np.mean(all_mit)), 3),
-                "safety_violation_rate": round(float(np.mean(all_safe)), 3),
-                "avg_turns": round(float(np.mean(all_turns)), 2),
-                "filtered_zero_var": filtered_zero_var,
-                "filtered_zero_winner": filtered_zero_winner,
-            }
+            # Truncate to exact multiple of `world_size` so all DDP ranks match micro-step count
+            usable = (len(payload_for_ranks) // world_size) * world_size
+            payload_for_ranks = payload_for_ranks[:usable]
+
+            if payload_for_ranks:
+                step_metrics = {
+                    "rl_step": step,
+                    "trajectories": len(payload_for_ranks),
+                    "batch_mean_reward": round(float(np.mean(all_rewards)), 4),
+                    "batch_max_reward": round(float(np.max(all_rewards)), 4),
+                    "mitigation_rate": round(float(np.mean(all_mit)), 3),
+                    "safety_violation_rate": round(float(np.mean(all_safe)), 3),
+                    "avg_turns": round(float(np.mean(all_turns)), 2),
+                    "filtered_zero_var": filtered_zero_var,
+                    "filtered_zero_winner": filtered_zero_winner,
+                }
 
         # Broadcast rollouts from rank 0 to all trainer ranks (GPUs 2 & 3)
         obj_box = [payload_for_ranks]
         dist.broadcast_object_list(obj_box, src=0)
         all_samples = obj_box[0]
+        if not all_samples:
+            if local_rank == 0:
+                print(f"[rlvr] Step {step}: no informative trajectories after {max_attempts_this_step} attempts; skipping update.", flush=True)
+            continue
+
         my_samples = [s for i, s in enumerate(all_samples) if i % world_size == local_rank]
 
         ddp_model.train()
         optimizer.zero_grad()
         loss_accum = 0.0
-        denom = float(max(1, len(my_samples)))
+        denom = float(len(my_samples))
 
-        for seq_ids, adv_np, mask_np in my_samples:
+        for s_idx, (seq_ids, adv_np, mask_np) in enumerate(my_samples):
             input_ids = torch.tensor([seq_ids], dtype=torch.long, device=device)
             adv_t = torch.tensor(adv_np, dtype=torch.float32, device=device)
             mask_t = torch.tensor(mask_np, dtype=torch.float32, device=device)
 
             with torch.no_grad():
                 old_lp, active_pos = _compute_masked_logprobs(peft_model, input_ids, mask_t)
-                if active_pos.numel() == 0:
-                    continue
                 with peft_model.disable_adapter():
                     ref_lp, _ = _compute_masked_logprobs(peft_model, input_ids, mask_t)
             torch.cuda.empty_cache()
 
-            new_lp, _ = _compute_masked_logprobs(ddp_model, input_ids, mask_t)
-            active_adv = adv_t[active_pos]
-            ratio = torch.exp(torch.clamp(new_lp - old_lp, -15.0, 15.0))
-            clipped = torch.clamp(ratio, 1.0 - dapo_cfg.clip_eps_low, 1.0 + dapo_cfg.clip_eps_high)
-            policy_loss = -torch.minimum(ratio * active_adv, clipped * active_adv).mean()
+            # Use `no_sync()` on all accumulation micro-steps except the last -> 1 clean AllReduce/step
+            sync_ctx = ddp_model.no_sync() if s_idx < len(my_samples) - 1 else contextlib.nullcontext()
+            with sync_ctx:
+                new_lp, _ = _compute_masked_logprobs(ddp_model, input_ids, mask_t)
+                active_adv = adv_t[active_pos]
+                ratio = torch.exp(torch.clamp(new_lp - old_lp, -15.0, 15.0))
+                clipped = torch.clamp(ratio, 1.0 - dapo_cfg.clip_eps_low, 1.0 + dapo_cfg.clip_eps_high)
+                policy_loss = -torch.minimum(ratio * active_adv, clipped * active_adv).mean()
 
-            log_ref_diff = torch.clamp(ref_lp - new_lp, -10.0, 10.0)
-            kl_loss = args.kl_coef * (torch.exp(log_ref_diff) - log_ref_diff - 1.0).mean()
+                log_ref_diff = torch.clamp(ref_lp - new_lp, -10.0, 10.0)
+                kl_loss = args.kl_coef * (torch.exp(log_ref_diff) - log_ref_diff - 1.0).mean()
 
-            loss = (policy_loss + kl_loss) / denom
-            loss.backward()
+                loss = (policy_loss + kl_loss) / denom
+                loss.backward()
             loss_accum += float(loss.detach().cpu())
             del loss, policy_loss, kl_loss, new_lp, old_lp, ref_lp
             torch.cuda.empty_cache()
@@ -449,7 +503,9 @@ def main() -> None:
         # Hot-sync updated weights to SGLang TP2 server on GPUs 0 & 1
         sync_s = 0.0
         if local_rank == 0:
-            sync_s = sync_lora_weights_to_sglang(peft_model, tokenizer, args.sglang_url, args.sync_dir)
+            sync_s = sync_lora_weights_to_sglang(
+                peft_model, tokenizer, args.sglang_url, args.sync_dir, args.base_model_path
+            )
             step_metrics["loss"] = round(loss_accum, 4)
             step_metrics["grad_norm"] = round(grad_norm, 3)
             step_metrics["sync_s"] = round(sync_s, 1)

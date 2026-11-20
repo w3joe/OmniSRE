@@ -147,7 +147,9 @@ def rollout_batch_multi_turn(
         for i in range(bsz):
             if done_flags[i]:
                 continue
-            fmt_msgs = format_multiturn_preserve_thinking(messages_list[i], preserve_thinking=True)
+            fmt_msgs = format_multiturn_preserve_thinking(
+                messages_list[i], preserve_thinking=True, keep_last_k_thoughts=max_turns
+            )
             p_ids = _chat_template_ids(tokenizer, fmt_msgs, add_generation_prompt=True)
             if len(p_ids) >= max_seq_len - max_new_tokens_per_turn:
                 done_flags[i] = True

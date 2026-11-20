@@ -56,13 +56,25 @@ CUDA_VISIBLE_DEVICES=0,1 python3 -m sglang.launch_server \
   > "${NVME_ROOT}/sglang_rollout_server.log" 2>&1 &
 SGLANG_PID=$!
 
-for i in $(seq 1 60); do
+SGLANG_READY=0
+for i in $(seq 1 90); do
+  if ! kill -0 "${SGLANG_PID}" 2>/dev/null; then
+    echo "[sglang] ERROR: SGLang server process exited prematurely!" >&2
+    tail -n 60 "${NVME_ROOT}/sglang_rollout_server.log" >&2 || true
+    exit 1
+  fi
   if curl -sf "http://127.0.0.1:${SGLANG_PORT}/health" >/dev/null 2>&1; then
     echo "[sglang] Rollout server ready on port ${SGLANG_PORT}!"
+    SGLANG_READY=1
     break
   fi
   sleep 5
 done
+if [[ "${SGLANG_READY}" -ne 1 ]]; then
+  echo "[sglang] ERROR: Timed out waiting for SGLang health endpoint!" >&2
+  tail -n 60 "${NVME_ROOT}/sglang_rollout_server.log" >&2 || true
+  exit 1
+fi
 
 echo "=== [3/3] Starting Split-GPU SGLang + DDP Multi-Turn DAPO+GTPO RLVR on GPUs 2,3 ==="
 CUDA_VISIBLE_DEVICES=2,3 torchrun --nproc_per_node=2 --master_port=29502 \
