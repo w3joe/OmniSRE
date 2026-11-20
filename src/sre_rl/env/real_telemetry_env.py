@@ -193,7 +193,11 @@ class RealTelemetryReplayEnvironment:
         t_end = t0 + self.post_window_s
 
         if rec.is_dejavu_long_format:
-            cache = self._load_dejavu_long_metrics(Path(rec.metrics_path), t_start, t0, t_end)
+            raw_p = Path(rec.metrics_path)
+            norm_p = raw_p.with_name("metrics.norm.csv")
+            cache = self._load_dejavu_long_metrics(
+                norm_p if norm_p.exists() else raw_p, t_start, t0, t_end
+            )
         else:
             mpath = Path(rec.simple_metrics_path or rec.metrics_path)
             if not mpath.exists():
@@ -259,11 +263,11 @@ class RealTelemetryReplayEnvironment:
             i_mean = float(np.mean(i_arr))
             i_p95 = float(np.percentile(i_arr, 95))
             i_max = float(np.max(i_arr))
-            denom = max(p_std, abs(p_mean) * 0.05, 1e-6)
+            # Robust floor avoids sparse 0.0 -> 0.002 jitter tying at z=999
+            denom = max(p_std, abs(p_mean) * 0.10, 0.15)
             z_score = abs(i_mean - p_mean) / denom
-            # Also capture spike magnitude via p95 deviation
             z_p95 = abs(i_p95 - p_mean) / denom
-            score = float(min(999.0, max(z_score, 0.7 * z_p95)))
+            score = float(min(250.0, max(z_score, 0.75 * z_p95)))
             summary_rows.append((svc, col, p_mean, p_std, i_mean, i_p95, i_max, score))
 
         summary_rows.sort(key=lambda r: r[7], reverse=True)
@@ -319,8 +323,11 @@ class RealTelemetryReplayEnvironment:
             i_mean = float(np.mean(i_arr))
             i_p95 = float(np.percentile(i_arr, 95))
             i_max = float(np.max(i_arr))
-            denom = max(p_std, abs(p_mean) * 0.05, 1e-6)
-            z = float(min(999.0, max(abs(i_mean - p_mean) / denom, 0.7 * abs(i_p95 - p_mean) / denom)))
+            # On DejaVu `metrics.norm.csv`, values are already global z-scores; combine
+            # local delta with absolute magnitude so true bank outages rank above zero-jitter.
+            denom = max(p_std, abs(p_mean) * 0.10, 0.25)
+            local_z = max(abs(i_mean - p_mean) / denom, 0.75 * abs(i_p95 - p_mean) / denom)
+            z = float(min(250.0, local_z))
             summary_rows.append((svc, metric_key, p_mean, p_std, i_mean, i_p95, i_max, z))
 
         summary_rows.sort(key=lambda r: r[7], reverse=True)

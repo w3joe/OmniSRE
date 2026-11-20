@@ -44,9 +44,11 @@ def _index_rcaeval_dir(ds_name: str, root: Path, start_idx: int) -> list[RealInc
 
         metrics_p = case_dir / "metrics.csv"
         simple_p = case_dir / "simple_metrics.csv"
-        if not metrics_p.exists() and not simple_p.exists():
+        data_p = case_dir / "data.csv"
+        if not metrics_p.exists() and not simple_p.exists() and not data_p.exists():
             continue
 
+        primary_m = metrics_p if metrics_p.exists() else (simple_p if simple_p.exists() else data_p)
         logs_p = case_dir / "logs.csv"
         traces_p = case_dir / "traces.csv"
         pod_nodes = sorted(case_dir.glob("pod-node-*.csv"))
@@ -60,7 +62,7 @@ def _index_rcaeval_dir(ds_name: str, root: Path, start_idx: int) -> list[RealInc
                 inject_timestamp=inject_ts,
                 ground_truth_service=root_svc,
                 ground_truth_fault=fault_type,
-                metrics_path=str(metrics_p if metrics_p.exists() else simple_p),
+                metrics_path=str(primary_m),
                 simple_metrics_path=str(simple_p) if simple_p.exists() else None,
                 logs_path=str(logs_p) if logs_p.exists() else None,
                 traces_path=str(traces_p) if traces_p.exists() else None,
