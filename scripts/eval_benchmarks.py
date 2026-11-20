@@ -214,7 +214,8 @@ def run_rcaeval_benchmark(
                 ["rcaeval-agent", "export", "--dataset", ds, "--out", str(tasks_root)],
                 check=True,
             )
-        case_dirs = sorted(p for p in ds_dir.iterdir() if p.is_dir())
+        cases_root = ds_dir / "cases" if (ds_dir / "cases").is_dir() else ds_dir
+        case_dirs = sorted(p for p in cases_root.iterdir() if p.is_dir())
         for cdir in case_dirs:
             all_task_dirs.append((ds, cdir))
 
@@ -264,7 +265,7 @@ def run_rcaeval_benchmark(
         for f in futs:
             res = f.result()
             preds_by_ds.setdefault(res["dataset"], []).append(
-                {"case": res["case"], "ranks": res["predictions"]}
+                {"case_id": res["case"], "ranks": res["predictions"]}
             )
 
     eval_scores: dict[str, Any] = {}
