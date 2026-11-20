@@ -75,12 +75,14 @@ def _chat_template_ids(
     add_generation_prompt: bool,
     reasoning_effort: str = "medium",
 ) -> list[int]:
+    # Qwen3.8 chat_template supports strictly {"low", "medium", "xhigh"}
+    mapped_effort = "xhigh" if reasoning_effort == "high" else reasoning_effort
     try:
         encoded = tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=mapped_effort,
         )
     except TypeError:
         encoded = tokenizer.apply_chat_template(
