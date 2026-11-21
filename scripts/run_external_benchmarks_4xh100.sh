@@ -112,7 +112,9 @@ uv venv --clear "${NVME_ROOT}/venv-openrca" --python 3.11
 uv pip install --python "${NVME_ROOT}/venv-openrca/bin/python" -r "${OPENRCA_DIR}/requirements.txt" "numpy<2" openai huggingface_hub gdown pandas loguru nbformat pyyaml
 
 mkdir -p "${OPENRCA_DIR}/dataset"
-if gcloud storage ls "${GCS_BUCKET}/openrca-raw/READY" >/dev/null 2>&1; then
+if [[ -f "${OPENRCA_DIR}/dataset/Telecom/query.csv" && -f "${OPENRCA_DIR}/dataset/Bank/query.csv" ]]; then
+  echo "[openrca] OpenRCA dataset already present on local NVMe!"
+elif gcloud storage ls "${GCS_BUCKET}/openrca-raw/READY" >/dev/null 2>&1; then
   echo "[openrca] Restoring cached OpenRCA dataset from GCS..."
   gcloud storage rsync -r "${GCS_BUCKET}/openrca-raw" "${OPENRCA_DIR}/dataset" --quiet
 else
@@ -147,47 +149,131 @@ for DS in "Telecom" "Bank" "Market/cloudbed-1"; do
 done
 echo "[openrca] Available datasets with query.csv + telemetry: ${AVAILABLE_OPENRCA_DS[*]:-NONE}"
 
-for DS in "${AVAILABLE_OPENRCA_DS[@]}"; do
-  echo "[openrca] Running OmniSRE v1.0 & Base Qwen3.8-27B concurrently on ${DS} (0..${END_IDX})..."
-  API_CONFIG_PATH="${OPENRCA_DIR}/config_omnisre.json" \
-    "${NVME_ROOT}/venv-openrca/bin/python" -m rca.run_agent_standard \
-    --dataset "${DS}" --start_idx 0 --end_idx "${END_IDX}" --tag omnisre_v1 \
-    > "${NVME_ROOT}/ext_results/openrca_omnisre_${DS//\//_}.log" 2>&1 &
-  P1=$!
+# Parallel 6-worker-per-model dispatcher (reuses any already-scored rows on disk!)
+OPENRCA_TASKS_PER_DS="${OPENRCA_TASKS_PER_DS}" "${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
+import concurrent.futures, glob, os, subprocess, pandas as pd
 
-  API_CONFIG_PATH="${OPENRCA_DIR}/config_base.json" \
-    "${NVME_ROOT}/venv-openrca/bin/python" -m rca.run_agent_standard \
-    --dataset "${DS}" --start_idx 0 --end_idx "${END_IDX}" --tag base_qwen38 \
-    > "${NVME_ROOT}/ext_results/openrca_base_${DS//\//_}.log" 2>&1 &
-  P2=$!
+openrca_dir = "/mnt/nvme/ext_bench/OpenRCA"
+py_bin = "/mnt/nvme/venv-openrca/bin/python"
+n_tasks = int(os.environ.get("OPENRCA_TASKS_PER_DS", "15"))
+datasets = [
+    ds for ds in ("Telecom", "Bank", "Market/cloudbed-1")
+    if os.path.exists(f"{openrca_dir}/dataset/{ds}/query.csv")
+]
 
-  wait "${P1}" || echo "[openrca] WARN: OmniSRE exited non-zero on ${DS}"
-  wait "${P2}" || echo "[openrca] WARN: Base exited non-zero on ${DS}"
-done
+def completed_rows(ds: str, prefix: str) -> set[int]:
+    done: set[int] = set()
+    for p in glob.glob(f"{openrca_dir}/test/result/{ds}/agent-{prefix}*.csv"):
+        try:
+            df = pd.read_csv(p)
+            for _, r in df.iterrows():
+                if str(r.get("score", "N/A")) != "N/A" and pd.notna(r.get("row_id")):
+                    done.add(int(float(r["row_id"])))
+        except Exception:
+            pass
+    return done
 
-# Summarize OpenRCA results into clean JSON
+def run_one(model_tag: str, cfg_path: str, ds: str, idx: int) -> str:
+    tag = f"{model_tag}_r{idx:02d}"
+    log_p = f"/mnt/nvme/ext_results/openrca_{tag}_{ds.replace('/', '_')}.log"
+    env = {**os.environ, "API_CONFIG_PATH": cfg_path}
+    with open(log_p, "w") as lf:
+        subprocess.run(
+            [
+                py_bin, "-m", "rca.run_agent_standard",
+                "--dataset", ds,
+                "--start_idx", str(idx),
+                "--end_idx", str(idx),
+                "--controller_max_step", "20",
+                "--timeout", "360",
+                "--tag", tag,
+            ],
+            cwd=openrca_dir,
+            env=env,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            timeout=450,
+            check=False,
+        )
+    return f"{model_tag}:{ds}:{idx}"
+
+def run_model_pool(model_tag: str, cfg_path: str, workers: int = 6) -> None:
+    jobs = []
+    for ds in datasets:
+        done = completed_rows(ds, model_tag)
+        missing = [i for i in range(n_tasks) if i not in done]
+        print(f"[openrca-pool] {model_tag} on {ds}: {len(done)} already done, {len(missing)} queued -> {missing}", flush=True)
+        for i in missing:
+            jobs.append((ds, i))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = [pool.submit(run_one, model_tag, cfg_path, ds, i) for ds, i in jobs]
+        for fut in concurrent.futures.as_completed(futs):
+            try:
+                print(f"[openrca-pool] finished {fut.result()}", flush=True)
+            except Exception as exc:
+                print(f"[openrca-pool] job error: {exc}", flush=True)
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as top:
+    f1 = top.submit(run_model_pool, "omnisre_v1", f"{openrca_dir}/config_omnisre.json", 6)
+    f2 = top.submit(run_model_pool, "base_qwen38", f"{openrca_dir}/config_base.json", 6)
+    f1.result()
+    f2.result()
+PY
+
+# Deduplicate & summarize all OpenRCA per-row + batch CSVs into clean JSON
 "${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
 import glob, json, os, pandas as pd
 root = "/mnt/nvme/ext_bench/OpenRCA/test/result"
+n_tasks = int(os.environ.get("OPENRCA_TASKS_PER_DS", "15"))
 summary = {"omnisre_v1": {}, "base_qwen38": {}}
-for csv_path in sorted(glob.glob(f"{root}/**/*.csv", recursive=True)):
-    rel = os.path.relpath(csv_path, root)
-    ds = os.path.dirname(rel)
-    fname = os.path.basename(rel)
-    key = "omnisre_v1" if "omnisre_v1" in fname else ("base_qwen38" if "base_qwen38" in fname else None)
-    if not key:
+
+for ds in ("Telecom", "Bank", "Market/cloudbed-1"):
+    ds_dir = os.path.join(root, ds)
+    if not os.path.isdir(ds_dir):
         continue
-    df = pd.read_csv(csv_path)
-    scores = pd.to_numeric(df["score"], errors="coerce").fillna(0.0)
-    summary[key][ds] = {
-        "tasks": int(len(df)),
-        "strict_accuracy": round(float((scores == 1.0).mean()), 4) if len(df) else 0.0,
-        "partial_score_mean": round(float(scores.mean()), 4) if len(df) else 0.0,
-    }
+    for key in ("omnisre_v1", "base_qwen38"):
+        frames = []
+        for p in sorted(glob.glob(f"{ds_dir}/agent-{key}*.csv")):
+            try:
+                frames.append(pd.read_csv(p))
+            except Exception:
+                pass
+        if not frames:
+            continue
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged[merged["score"].astype(str) != "N/A"].copy()
+        if "row_id" in merged.columns:
+            merged["row_id_int"] = pd.to_numeric(merged["row_id"], errors="coerce")
+            merged = merged.dropna(subset=["row_id_int"])
+            merged["row_id_int"] = merged["row_id_int"].astype(int)
+            merged = merged[merged["row_id_int"] < n_tasks]
+            merged = merged.sort_values("row_id_int").drop_duplicates(subset=["row_id_int"], keep="last")
+        merged_out = os.path.join(ds_dir, f"merged_{key}.csv")
+        merged.to_csv(merged_out, index=False)
+        scores = pd.to_numeric(merged["score"], errors="coerce").fillna(0.0)
+        crashes = merged["prediction"].astype(str).str.contains("Sandbox execution terminated", na=False)
+        summary[key][ds] = {
+            "tasks": int(len(merged)),
+            "strict_accuracy": round(float((scores == 1.0).mean()), 4) if len(merged) else 0.0,
+            "partial_score_mean": round(float(scores.mean()), 4) if len(merged) else 0.0,
+            "sandbox_crash_rate": round(float(crashes.mean()), 4) if len(merged) else 0.0,
+        }
+
+for key in ("omnisre_v1", "base_qwen38"):
+    vals = list(summary[key].values())
+    tot = sum(v["tasks"] for v in vals)
+    if tot > 0:
+        summary[key]["OVERALL"] = {
+            "tasks": tot,
+            "strict_accuracy": round(sum(v["strict_accuracy"] * v["tasks"] for v in vals) / tot, 4),
+            "partial_score_mean": round(sum(v["partial_score_mean"] * v["tasks"] for v in vals) / tot, 4),
+            "sandbox_crash_rate": round(sum(v["sandbox_crash_rate"] * v["tasks"] for v in vals) / tot, 4),
+        }
+
 out_p = "/mnt/nvme/ext_results/openrca_summary.json"
 with open(out_p, "w") as fh:
     json.dump(summary, fh, indent=2)
-print("OPENRCA_SUMMARY:", json.dumps(summary))
+print("OPENRCA_SUMMARY:", json.dumps(summary, indent=2))
 PY
 cp -r "${OPENRCA_DIR}/test/result" "${NVME_ROOT}/ext_results/openrca_csvs" 2>/dev/null || true
 gcloud storage rsync -r "${NVME_ROOT}/ext_results" "${GCS_OUT}" --quiet
