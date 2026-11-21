@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import datetime
 import json
 import os
 import random
@@ -551,11 +552,20 @@ def sync_lora_weights_to_sglang(peft_model, tokenizer, sglang_base_url: str, syn
     peft_model.eval()
     peft_model.merge_adapter()
     try:
-        peft_model.base_model.model.save_pretrained(tmp_dir, safe_serialization=True)
+        # Build clean zero-copy merged state_dict (strip `.base_layer.` and omit `.lora_A/.lora_B`)
+        # so SGLang `/update_weights_from_disk` AND HF `from_pretrained` load 100% of updated weights!
+        clean_sd = {}
+        for k, v in peft_model.base_model.model.state_dict().items():
+            if ".lora_A." in k or ".lora_B." in k or ".lora_embedding_" in k:
+                continue
+            clean_sd[k.replace(".base_layer.", ".")] = v
+        peft_model.base_model.model.save_pretrained(
+            tmp_dir, state_dict=clean_sd, safe_serialization=True
+        )
         tokenizer.save_pretrained(tmp_dir)
         src = Path(base_model_path)
         if src.is_dir():
-            for fname in ("preprocessor_config.json", "video_preprocessor_config.json"):
+            for fname in ("processor_config.json", "preprocessor_config.json", "video_preprocessor_config.json"):
                 if (src / fname).exists():
                     shutil.copy2(src / fname, tmp_dir / fname)
     finally:
@@ -630,7 +640,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    dist.init_process_group(backend="nccl")
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=45))
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}")

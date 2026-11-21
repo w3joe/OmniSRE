@@ -353,11 +353,18 @@ def sync_lora_weights_to_sglang(peft_model, tokenizer, sglang_base_url: str, syn
     peft_model.eval()
     peft_model.merge_adapter()
     try:
-        peft_model.base_model.model.save_pretrained(tmp_dir, safe_serialization=True)
+        clean_sd = {}
+        for k, v in peft_model.base_model.model.state_dict().items():
+            if ".lora_A." in k or ".lora_B." in k or ".lora_embedding_" in k:
+                continue
+            clean_sd[k.replace(".base_layer.", ".")] = v
+        peft_model.base_model.model.save_pretrained(
+            tmp_dir, state_dict=clean_sd, safe_serialization=True
+        )
         tokenizer.save_pretrained(tmp_dir)
         src = Path(base_model_path)
         if src.is_dir():
-            for fname in ("preprocessor_config.json", "video_preprocessor_config.json"):
+            for fname in ("processor_config.json", "preprocessor_config.json", "video_preprocessor_config.json"):
                 if (src / fname).exists():
                     shutil.copy2(src / fname, tmp_dir / fname)
     finally:
