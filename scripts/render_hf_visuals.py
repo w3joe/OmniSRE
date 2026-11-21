@@ -228,7 +228,7 @@ def render_hero(out_path: Path) -> None:
         ax,
         right,
         top - 0.27,
-        "v0.1 draft · November 2026",
+        "v1.0 · November 2026",
         size=7.8,
         color=FAINT,
         family=MONO,
@@ -291,10 +291,10 @@ def render_hero(out_path: Path) -> None:
     grid_top = 1.5
     _hline(ax, MARGIN, right, grid_top, color=RULE_2, lw=0.8)
     specs = [
-        ("PARAMETERS", "27B", "Hybrid Gated DeltaNet + Attention"),
-        ("LICENSE", "Apache 2.0", "Open weights, fully self-hostable"),
-        ("CONTEXT", "262K", "Native tokens, ~2 GB FP8 KV @ 64K"),
-        ("POST-TRAINING", "Read-Before-Write RLVR", "SFT warm-start, then DAPO + GTPO"),
+        ("REMEDIATION", "98.3%", "Pass@1 vs. 30.0% Base · 0% safety viol."),
+        ("CONSISTENCY", "88.3%", "Pass^3 (3/3) vs. 6.7% Base · 13.2× lift"),
+        ("REAL PROD RCA", "99.2%", "Root service on 129 unseen outages · 3.6× faster"),
+        ("WEIGHTS", "Apache 2.0", "27B standalone BF16 · 1 × H100 FP8 serving"),
     ]
     col_w = (right - MARGIN) / len(specs)
     for i, (label, value, sub) in enumerate(specs):
@@ -762,18 +762,196 @@ def render_dataset_infographic(out_path: Path) -> None:
     _save(fig, out_path)
 
 
+# ── Figure 4: v1.0 Held-Out Benchmarks & RLVR Curve ──────────────────────────
+def render_benchmarks(out_path: Path) -> None:
+    w, h = 14.0, 6.9
+    fig, ax = _canvas(w, h)
+    right = w - MARGIN
+    _masthead(
+        ax,
+        w,
+        h,
+        "FIG. 2 — ZERO-CONTAMINATION BENCHMARKS",
+        "OmniSRE v1.0 vs. Base Qwen3.8-27B on unseen production systems",
+        "Evaluated on 60 × 3 unseen K8s write-remediation topologies and all 129 unseen "
+        "real production outages (DejaVu-C Oracle DB + 41-service Train Ticket).",
+    )
+
+    # Left panel: paired horizontal bars (OmniSRE v1.0 vs Base)
+    bar_x0 = MARGIN + 2.95
+    bar_max_w = 3.55
+    _t(ax, MARGIN, 4.92, "SIDE-BY-SIDE EVAL", size=7.6, color=ACCENT, family=MONO, weight="bold")
+    # Legend pills
+    ax.add_patch(Rectangle((bar_x0 + 0.65, 4.92), 0.14, 0.11, facecolor=ACCENT, edgecolor="none"))
+    _t(ax, bar_x0 + 0.85, 4.92, "OmniSRE v1.0", size=8.2, color=INK, weight="bold")
+    ax.add_patch(Rectangle((bar_x0 + 2.15, 4.92), 0.14, 0.11, facecolor=RULE_2, edgecolor="none"))
+    _t(ax, bar_x0 + 2.35, 4.92, "Base Qwen3.8-27B", size=8.2, color=MUTED)
+    _hline(ax, MARGIN, bar_x0 + bar_max_w + 0.72, 4.78, color=RULE_2, lw=0.6)
+
+    metrics = [
+        ("Write Fix · Pass@1", "60 unseen topologies", 98.3, 30.0),
+        ("Write Fix · Pass^3", "all 3/3 runs succeed", 88.3, 6.7),
+        ("Write Fix · Pass@3", "at least 1/3 succeeds", 100.0, 71.7),
+        ("Real RCA · Root Svc", "all 129 unseen outages", 99.2, 87.6),
+        ("Real RCA · Solved", "all 129 · 3.6× fewer turns", 75.2, 73.6),
+        ("Oracle DB · 5× Tree", "DejaVu-C (100% svc)", 75.0, 65.7),
+    ]
+    y = 4.35
+    row_step = 0.65
+    for name, sub, omni_v, base_v in metrics:
+        _t(ax, MARGIN, y + 0.06, name, size=10.0, color=INK, weight="bold")
+        _t(ax, MARGIN, y - 0.16, sub, size=8.3, color=MUTED)
+        # OmniSRE bar (top)
+        ow = max(bar_max_w * omni_v / 100.0, 0.04)
+        ax.add_patch(Rectangle((bar_x0, y + 0.01), ow, 0.16, facecolor=ACCENT, edgecolor="none"))
+        _t(
+            ax,
+            bar_x0 + ow + 0.08,
+            y + 0.09,
+            f"{omni_v:.1f}%",
+            size=8.6,
+            color=ACCENT,
+            family=MONO,
+            weight="bold",
+            va="center",
+        )
+        # Base bar (bottom)
+        bw = max(bar_max_w * base_v / 100.0, 0.04)
+        ax.add_patch(Rectangle((bar_x0, y - 0.17), bw, 0.14, facecolor=RULE_2, edgecolor="none"))
+        _t(
+            ax,
+            bar_x0 + bw + 0.08,
+            y - 0.10,
+            f"{base_v:.1f}%",
+            size=8.2,
+            color=MUTED,
+            family=MONO,
+            va="center",
+        )
+        y -= row_step
+
+    # Divider
+    div_x = 7.75
+    _vline(ax, div_x, 0.85, 5.0, color=RULE, lw=0.7)
+
+    # Right panel: On-Policy Masked CISPO RLVR Curve (Steps 0 -> 100 peak)
+    rx = div_x + 0.72
+    rw = right - rx - 0.18
+    _t(
+        ax,
+        div_x + 0.35,
+        4.92,
+        "RLVR LIFT & MTTR COMPRESSION (40 UNSEEN REAL)",
+        size=7.6,
+        color=ACCENT,
+        family=MONO,
+        weight="bold",
+    )
+
+    a = fig.add_axes((rx / w, 1.12 / h, rw / w, 3.45 / h))
+    a.set_facecolor(PAPER)
+    for side in ("top", "right", "left"):
+        a.spines[side].set_visible(False)
+    a.spines["bottom"].set_color(RULE_2)
+    a.spines["bottom"].set_linewidth(0.8)
+    a.set_axisbelow(True)
+    a.grid(axis="y", color=RULE, lw=0.7)
+
+    steps = [0, 25, 50, 75, 100]
+    solved = [22.5, 62.5, 77.5, 80.0, 92.5]
+    turns = [20.1, 11.1, 4.8, 4.2, 3.7]
+
+    a.set_xlim(-5, 110)
+    a.set_ylim(0, 105)
+    a.xaxis.set_major_locator(FixedLocator(steps))
+    a.yaxis.set_major_locator(FixedLocator([0, 25, 50, 75, 100]))
+    a.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    a.tick_params(axis="both", length=0, labelsize=8.4, labelcolor=MUTED, pad=6)
+    a.tick_params(axis="x", length=3, color=RULE_2, width=0.8)
+    for lab in a.get_xticklabels() + a.get_yticklabels():
+        lab.set_family(MONO)
+
+    a.plot(steps, solved, color=ACCENT, lw=2.2, marker="o", ms=5.0, mec=PAPER, mew=1.0, zorder=4)
+    for sx, sy, dx, dy in [(0, 22.5, 4, -14), (25, 62.5, -2, 10), (50, 77.5, 0, 9), (75, 80.0, 0, 9), (100, 92.5, 0, 8)]:
+        a.annotate(
+            f"{sy:.1f}%",
+            (sx, sy),
+            xytext=(dx, dy),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8.2,
+            family=MONO,
+            color=ACCENT,
+            fontweight="bold" if sx == 100 else "normal",
+        )
+
+    # Secondary axis for Avg Turns (MTTR)
+    a2 = a.twinx()
+    for side in ("top", "left", "bottom", "right"):
+        a2.spines[side].set_visible(False)
+    a2.set_ylim(0, 24)
+    a2.yaxis.set_major_locator(FixedLocator([0, 6, 12, 18, 24]))
+    a2.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}t"))
+    a2.tick_params(axis="y", length=0, labelsize=8.0, labelcolor=WARM, pad=4)
+    for lab in a2.get_yticklabels():
+        lab.set_family(MONO)
+    a2.plot(steps, turns, color=WARM, lw=1.6, ls="--", marker="s", ms=4.2, mec=PAPER, mew=0.8, zorder=3)
+    a2.annotate(
+        "20.1t",
+        (0, 20.1),
+        xytext=(14, 2),
+        textcoords="offset points",
+        fontsize=8.0,
+        family=MONO,
+        color=WARM,
+    )
+    a2.annotate(
+        "3.7t",
+        (100, 3.7),
+        xytext=(-4, 9),
+        textcoords="offset points",
+        ha="right",
+        fontsize=8.2,
+        family=MONO,
+        color=WARM,
+        fontweight="bold",
+    )
+
+    a.set_xlabel("Masked CISPO RLVR step (on-policy, 60% MCP schema rand.)", fontsize=8.4, color=FAINT, labelpad=6)
+
+    # Mini legend above right plot
+    ax.add_patch(Rectangle((rx, 4.64), 0.18, 0.05, facecolor=ACCENT, edgecolor="none"))
+    _t(ax, rx + 0.24, 4.62, "Unseen Real Solved (%)", size=8.2, color=ACCENT, weight="bold")
+    _hline(ax, rx + 2.25, rx + 2.48, 4.66, color=WARM, lw=1.6)
+    _t(ax, rx + 2.54, 4.62, "Avg Turns (MTTR)", size=8.2, color=WARM)
+
+    _t(
+        ax,
+        MARGIN,
+        0.22,
+        "Source: v1_full_benchmark_results.json (4 × H100 SGLang 0.5.23 TP2, TITO) · "
+        "0.0% greedy safety violations · step_100 best_checkpoint",
+        size=7.4,
+        color=FAINT,
+        family=MONO,
+    )
+
+    _save(fig, out_path)
+
+
 def main() -> None:
     assets_dir = REPO_ROOT / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
     render_hero(assets_dir / "omnisre_hero.png")
     render_architecture(assets_dir / "omnisre_architecture.png")
+    render_benchmarks(assets_dir / "omnisre_benchmarks.png")
     render_training_curves(
         Path("/tmp/stage1a.log"),
         Path("/tmp/phase1b.log"),
         assets_dir / "omnisre_training_curves.png",
     )
     render_dataset_infographic(assets_dir / "omnisre_dataset_infographic.png")
-    print(f"Rendered 4 OmniSRE figures in {assets_dir}")
+    print(f"Rendered 5 OmniSRE figures in {assets_dir}")
 
 
 if __name__ == "__main__":
