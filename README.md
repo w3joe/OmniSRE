@@ -2,7 +2,7 @@
 
 **OmniSRE** is an open-weights Site Reliability Engineering agent (`27B`, Apache 2.0) post-trained via **Multi-World RLVR** (Masked CISPO, native TITO, `60%` MCP tool-schema randomization, and offline evidence synthesis) so any team can self-host autonomous incident triage, root-cause localization, and **read-before-write remediation**.
 
-Standalone BF16 Weights (`v1.0`) · Apache 2.0 · [Hugging Face (`w3joe/OmniSRE`)](https://huggingface.co/w3joe/OmniSRE) · GCP `4 × H100` Ready
+Standalone BF16 Weights (`v1.0`) · Apache 2.0 · [Technical Report (`w3joe.github.io/OmniSRE`)](https://w3joe.github.io/OmniSRE/) · [Hugging Face (`w3joe/OmniSRE`)](https://huggingface.co/w3joe/OmniSRE) · GCP `4 × H100` Ready
 
 <br/>
 

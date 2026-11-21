@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OmniSRE-27B — Open-Weights Read-Before-Write SRE Agent</title>
+  <meta name="description" content="Technical report for OmniSRE-27B (Apache 2.0): post-training a 27B hybrid Gated DeltaNet + Attention model with multi-world RLVR for autonomous incident triage, root-cause localization, and read-before-write remediation." />
+  <meta property="og:title" content="OmniSRE-27B — Open-Weights Autonomous SRE Agent" />
+  <meta property="og:description" content="98.3% Pass@1 write remediation (vs. 30.0% Base), 88.3% Pass^3 consistency (13.2x Base), 99.2% root-service localization on 129 unseen real outages, 0.0% safety violations." />
+  <meta property="og:image" content="https://w3joe.github.io/OmniSRE/assets/omnisre_hero.png" />
+  <meta name="twitter:card" content="summary_large_image" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,600;0,6..72,700;1,6..72,400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --paper: #FAF9F7;
+      --paper-elev: #F4F2EE;
+      --ink: #18181B;
+      --ink-2: #3F3F46;
+      --muted: #52525B;
+      --faint: #71717A;
+      --rule: #E4E4E7;
+      --rule-strong: #D4D4D8;
+      --accent: #0F766E;
+      --accent-tint: #E3F1EF;
+      --warm: #B45309;
+      --warm-tint: #FBF1E6;
+      --serif: "Newsreader", Charter, "Bitstream Charter", Georgia, serif;
+      --sans: "Inter", "Helvetica Neue", -apple-system, BlinkMacSystemFont, sans-serif;
+      --mono: "IBM Plex Mono", Menlo, Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.68;
+      -webkit-font-smoothing: antialiased;
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      background: var(--paper);
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: underline;
+      text-decoration-thickness: 1px;
+      text-underline-offset: 3px;
+    }
+    a:hover { color: var(--ink); }
+
+    /* Top utility bar */
+    .topbar {
+      border-bottom: 1px solid var(--rule);
+      background: rgba(250, 249, 247, 0.94);
+      backdrop-filter: blur(6px);
+      position: sticky;
+      top: 0;
+      z-index: 40;
+    }
+    .topbar-inner {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 0.72rem 1.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      font-size: 0.82rem;
+    }
+    .brand {
+      font-family: var(--mono);
+      font-weight: 600;
+      color: var(--ink);
+      text-decoration: none;
+      letter-spacing: 0.02em;
+    }
+    .brand span { color: var(--accent); }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+      flex-wrap: wrap;
+    }
+    .nav-links a {
+      text-decoration: none;
+      color: var(--muted);
+      font-weight: 500;
+    }
+    .nav-links a:hover { color: var(--ink); }
+    .nav-pill {
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      padding: 0.3rem 0.68rem;
+      border: 1px solid var(--ink);
+      color: var(--ink) !important;
+      background: transparent;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .nav-pill.primary {
+      background: var(--ink);
+      color: var(--paper) !important;
+    }
+    .nav-pill:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--paper) !important;
+    }
+
+    /* Layout shell */
+    .shell {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 3.2rem 1.5rem 5rem;
+      display: grid;
+      grid-template-columns: 200px minmax(0, 1fr);
+      gap: 3.5rem;
+    }
+
+    @media (max-width: 920px) {
+      .shell {
+        grid-template-columns: 1fr;
+        gap: 2rem;
+        padding-top: 2rem;
+      }
+      .toc { display: none; }
+    }
+
+    /* Sticky left TOC */
+    .toc {
+      position: sticky;
+      top: 4.5rem;
+      align-self: start;
+      font-size: 0.8rem;
+      border-top: 1.5px solid var(--ink);
+      padding-top: 0.85rem;
+    }
+    .toc-label {
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      color: var(--accent);
+      text-transform: uppercase;
+      margin-bottom: 0.75rem;
+    }
+    .toc ol {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+    }
+    .toc li {
+      margin-bottom: 0.52rem;
+      line-height: 1.35;
+    }
+    .toc a {
+      text-decoration: none;
+      color: var(--muted);
+    }
+    .toc a:hover { color: var(--ink); }
+    .toc-meta {
+      margin-top: 1.6rem;
+      padding-top: 0.9rem;
+      border-top: 1px solid var(--rule);
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--faint);
+      line-height: 1.6;
+    }
+
+    /* Main monograph column */
+    main { max-width: 780px; }
+
+    .kicker {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      border-top: 1.5px solid var(--ink);
+      padding-top: 0.85rem;
+      display: flex;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+    .kicker span.date { color: var(--faint); font-weight: 400; }
+
+    h1 {
+      font-family: var(--serif);
+      font-size: clamp(2.25rem, 4.2vw, 3.25rem);
+      font-weight: 700;
+      line-height: 1.12;
+      letter-spacing: -0.015em;
+      margin: 0.85rem 0 1rem;
+      color: var(--ink);
+    }
+
+    .subtitle {
+      font-size: 1.18rem;
+      font-weight: 300;
+      line-height: 1.52;
+      color: var(--ink-2);
+      margin: 0 0 1.5rem;
+    }
+
+    .artifact-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+      padding: 1rem 0 1.4rem;
+      border-bottom: 1px solid var(--rule-strong);
+      margin-bottom: 2rem;
+    }
+    .btn {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      font-weight: 500;
+      text-decoration: none;
+      padding: 0.52rem 0.95rem;
+      border: 1px solid var(--ink);
+      color: var(--ink);
+      background: var(--paper);
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+    .btn.solid {
+      background: var(--ink);
+      color: var(--paper);
+    }
+    .btn:hover {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--paper);
+    }
+
+    /* Key stats grid */
+    .stat-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      border-top: 1px solid var(--rule-strong);
+      border-bottom: 1px solid var(--rule-strong);
+      margin: 1.8rem 0 2.2rem;
+      padding: 1.05rem 0;
+      gap: 1rem;
+    }
+    @media (max-width: 680px) {
+      .stat-strip { grid-template-columns: repeat(2, 1fr); }
+    }
+    .stat-cell {
+      padding-right: 0.75rem;
+      border-right: 1px solid var(--rule);
+    }
+    .stat-cell:last-child { border-right: none; }
+    .stat-eyebrow {
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--faint);
+    }
+    .stat-num {
+      font-family: var(--serif);
+      font-size: 1.95rem;
+      font-weight: 700;
+      line-height: 1.15;
+      color: var(--ink);
+      margin: 0.2rem 0 0.15rem;
+    }
+    .stat-num.teal { color: var(--accent); }
+    .stat-note {
+      font-size: 0.78rem;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    /* Abstract box */
+    .abstract {
+      background: var(--paper-elev);
+      border-left: 2.5px solid var(--accent);
+      padding: 1.25rem 1.45rem;
+      margin: 1.75rem 0 2.4rem;
+      font-size: 0.96rem;
+      color: var(--ink-2);
+    }
+    .abstract-title {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 0.45rem;
+    }
+    .abstract p { margin: 0; }
+
+    /* Typography */
+    h2 {
+      font-family: var(--serif);
+      font-size: 1.65rem;
+      font-weight: 700;
+      line-height: 1.24;
+      margin: 3rem 0 0.75rem;
+      padding-top: 0.9rem;
+      border-top: 1px solid var(--rule-strong);
+      color: var(--ink);
+    }
+    h2 .sec-no {
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--accent);
+      display: block;
+      margin-bottom: 0.25rem;
+      letter-spacing: 0.06em;
+    }
+    h3 {
+      font-family: var(--sans);
+      font-size: 1.05rem;
+      font-weight: 600;
+      margin: 1.8rem 0 0.5rem;
+      color: var(--ink);
+    }
+    p {
+      margin: 0 0 1.05rem;
+      color: var(--ink-2);
+    }
+    ul, ol {
+      margin: 0 0 1.2rem;
+      padding-left: 1.3rem;
+      color: var(--ink-2);
+    }
+    li { margin-bottom: 0.42rem; }
+    strong { color: var(--ink); font-weight: 600; }
+
+    code {
+      font-family: var(--mono);
+      font-size: 0.84em;
+      background: var(--paper-elev);
+      padding: 0.12rem 0.34rem;
+      border: 1px solid var(--rule);
+      color: var(--ink);
+    }
+
+    pre {
+      background: var(--paper-elev);
+      border: 1px solid var(--rule-strong);
+      padding: 1rem 1.15rem;
+      overflow-x: auto;
+      margin: 1rem 0 1.5rem;
+      line-height: 1.52;
+    }
+    pre code {
+      background: none;
+      border: none;
+      padding: 0;
+      font-size: 0.8rem;
+    }
+
+    /* Figures */
+    figure {
+      margin: 1.8rem 0 2.2rem;
+      border: 1px solid var(--rule-strong);
+      background: var(--paper);
+      padding: 0.5rem;
+    }
+    figure img {
+      width: 100%;
+      height: auto;
+      display: block;
+    }
+    figcaption {
+      font-size: 0.8rem;
+      color: var(--muted);
+      padding: 0.65rem 0.55rem 0.35rem;
+      border-top: 1px solid var(--rule);
+      margin-top: 0.45rem;
+      line-height: 1.48;
+    }
+    figcaption strong {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      color: var(--accent);
+      margin-right: 0.35rem;
+    }
+
+    /* Publication tables */
+    .table-wrap {
+      overflow-x: auto;
+      margin: 1.35rem 0 1.9rem;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.86rem;
+      border-top: 1.5px solid var(--ink);
+      border-bottom: 1.5px solid var(--ink);
+    }
+    thead th {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      text-align: left;
+      padding: 0.62rem 0.65rem;
+      border-bottom: 1px solid var(--rule-strong);
+      background: var(--paper-elev);
+    }
+    thead th.num, tbody td.num { text-align: right; font-family: var(--mono); }
+    tbody td {
+      padding: 0.58rem 0.65rem;
+      border-bottom: 1px solid var(--rule);
+      color: var(--ink-2);
+      vertical-align: top;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr.highlight td {
+      background: var(--accent-tint);
+      color: var(--ink);
+      font-weight: 500;
+    }
+    .gain {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    /* Formula callout */
+    .formula {
+      background: var(--paper-elev);
+      border-top: 1px solid var(--rule-strong);
+      border-bottom: 1px solid var(--rule-strong);
+      padding: 0.95rem 1.2rem;
+      margin: 1.25rem 0 1.5rem;
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      color: var(--ink);
+      overflow-x: auto;
+    }
+
+    .callout-note {
+      background: var(--warm-tint);
+      border-left: 2.5px solid var(--warm);
+      padding: 0.9rem 1.15rem;
+      margin: 1.35rem 0;
+      font-size: 0.88rem;
+      color: var(--ink-2);
+    }
+
+    footer {
+      margin-top: 4rem;
+      padding-top: 1.5rem;
+      border-top: 1.5px solid var(--ink);
+      font-size: 0.8rem;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+  </style>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top">OmniSRE<span>-27B</span> · v1.0</a>
+      <nav class="nav-links">
+        <a href="#architecture">Architecture</a>
+        <a href="#rlvr">Multi-World RLVR</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#quickstart">Quickstart</a>
+        <a class="nav-pill" href="https://github.com/w3joe/OmniSRE" target="_blank" rel="noopener">GitHub Code</a>
+        <a class="nav-pill primary" href="https://huggingface.co/w3joe/OmniSRE" target="_blank" rel="noopener">HF Weights (Apache 2.0)</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="shell" id="top">
+    <aside class="toc" aria-label="Table of contents">
+      <div class="toc-label">Contents</div>
+      <ol>
+        <li><a href="#abstract">Abstract</a></li>
+        <li><a href="#problem">1. Read-Before-Write SRE</a></li>
+        <li><a href="#architecture">2. Hybrid 27B &amp; SFT Corpus</a></li>
+        <li><a href="#rlvr">3. Multi-World RLVR</a></li>
+        <li><a href="#benchmarks">4. Empirical Results</a></li>
+        <li><a href="#ablations">5. Dynamics &amp; Limitations</a></li>
+        <li><a href="#quickstart">6. Self-Hosting &amp; Citation</a></li>
+      </ol>
+      <div class="toc-meta">
+        <div><strong>Weights:</strong> <a href="https://huggingface.co/w3joe/OmniSRE">w3joe/OmniSRE</a></div>
+        <div><strong>Base:</strong> Qwen/Qwen3.8-27B</div>
+        <div><strong>Format:</strong> BF16 (51.0 GiB)</div>
+        <div><strong>License:</strong> Apache 2.0</div>
+      </div>
+    </aside>
+
+    <main>
+      <div class="kicker">
+        <span>OPEN-WEIGHTS TECHNICAL REPORT · OMNISRE v1.0</span>
+        <span class="date">November 2026</span>
+      </div>
+
+      <h1>OmniSRE-27B: Read-Before-Write Reinforcement Learning for Autonomous Site Reliability Engineering</h1>
+
+      <p class="subtitle">
+        Post-training a 27B hybrid Gated DeltaNet + Gated Attention model across real production multi-modal telemetry and policy-gated Kubernetes remediation environments — released openly under Apache&nbsp;2.0.
+      </p>
+
+      <div class="artifact-bar">
+        <a class="btn solid" href="https://huggingface.co/w3joe/OmniSRE" target="_blank" rel="noopener">Model Weights · huggingface.co/w3joe/OmniSRE</a>
+        <a class="btn" href="https://github.com/w3joe/OmniSRE" target="_blank" rel="noopener">Training &amp; Eval Code · github.com/w3joe/OmniSRE</a>
+        <a class="btn" href="#quickstart">Serve on 1 &times; H100 (SGLang FP8)</a>
+      </div>
+
+      <div class="stat-strip">
+        <div class="stat-cell">
+          <div class="stat-eyebrow">Write Fix · Pass@1</div>
+          <div class="stat-num teal">98.3%</div>
+          <div class="stat-note">vs. 30.0% Base (+68.3 pp) · 0.0% greedy safety viol.</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-eyebrow">Consistency · Pass^3</div>
+          <div class="stat-num">88.3%</div>
+          <div class="stat-note">3/3 runs succeed vs. 6.7% Base (13.2&times; lift)</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-eyebrow">Real Prod Root Svc</div>
+          <div class="stat-num">99.2%</div>
+          <div class="stat-note">128 / 129 unseen real outages (DejaVu-C + RE3-TT)</div>
+        </div>
+        <div class="stat-cell">
+          <div class="stat-eyebrow">MTTR Compression</div>
+          <div class="stat-num">3.6&times;</div>
+          <div class="stat-note">4.07 vs. 14.59 turns across 129 real outages</div>
+        </div>
+      </div>
+
+      <figure>
+        <img src="assets/omnisre_hero.png" alt="OmniSRE 27B v1.0 overview card" />
+        <figcaption><strong>OVERVIEW</strong> Standalone 27B BF16 open-weights checkpoint (<a href="https://huggingface.co/w3joe/OmniSRE"><code>w3joe/OmniSRE</code></a>) post-trained on <code>4 &times; H100</code> GPUs and deployable on a single <code>H100</code> or <code>L40S</code> in FP8.</figcaption>
+      </figure>
+
+      <section class="abstract" id="abstract">
+        <div class="abstract-title">Abstract</div>
+        <p>
+          Production incident response requires an agent to triage noisy multi-modal telemetry (Prometheus time-series, container logs, distributed traces, and database wait events), isolate upstream root causes from downstream symptom cascades, and execute safe cluster mutations without triggering secondary outages. While proprietary SRE agents remain closed SaaS products, general open-weights models suffer severe run-to-run flakiness (<code>6.7%</code> <code>Pass^3</code> on write-gated remediation) and burn <code>3&ndash;4&times;</code> excessive investigation turns. We present <strong>OmniSRE-27B</strong> (<code>v1.0</code>), an Apache&nbsp;2.0 open-weights SRE agent post-trained from <code>Qwen/Qwen3.8-27B</code> via a two-phase supervised warm-start followed by <strong>Multi-World On-Policy RLVR</strong> combining Masked CISPO (zero KL penalty), native SGLang Token-In-Token-Out (<code>TITO</code>) rollouts, <code>60%</code> MCP tool-schema randomization, and <code>25%</code> offline evidence synthesis. Evaluated strictly zero-shot on unseen Kubernetes topologies and all <code>129</code> held-out real production outages from <code>DejaVu-C</code> (commercial Oracle databases) and <code>RCAEval RE3-TT</code> (41-service Train Ticket), OmniSRE-27B lifts greedy write-remediation <code>Pass@1</code> from <code>30.0% &rarr; 98.3%</code> and <code>Pass^3</code> from <code>6.7% &rarr; 88.3%</code> with <code>0.0%</code> greedy safety violations, while localizing <code>99.2%</code> (<code>128/129</code>) of real production root-cause services in <code>4.07</code> turns.
+        </p>
+      </section>
+
+      <h2 id="problem"><span class="sec-no">SECTION 01</span>The Read-Before-Write Incident Loop</h2>
+      <p>
+        Most public AIOps benchmarks evaluate <em>read-only</em> root-cause classification in isolation, whereas production on-call engineers must also decide <em>whether</em> and <em>how</em> to mutate live infrastructure: rolling back a faulty deployment, patching a broken ConfigMap, scaling through a metastable retry storm, or abstaining cleanly during benign false alarms and external provider outages.
+      </p>
+      <p>
+        OmniSRE enforces a deterministic <strong>read-before-write policy gate</strong> inside the RLVR environment and reward verifier:
+      </p>
+      <ul>
+        <li><strong>Mandatory evidence gathering:</strong> Any cluster mutation (<code>apply_remediation</code>, <code>rollback_release</code>, <code>scale_resource</code>, <code>kubectl patch</code>) attempted prior to at least two distinct read-only telemetry inspections is blocked and penalized as a safety violation.</li>
+        <li><strong>Blast-radius &amp; anti-cheat RBAC:</strong> In live Kubernetes sandboxes (<code>infra/k8s/sre_agent_rbac.yaml</code>), the agent ServiceAccount is scoped strictly to target workload namespaces and barred from inspecting fault-injector planes (<code>sregym-injector</code>, <code>chaos-mesh</code>, <code>kube-system</code>) or deleting namespaces/secrets.</li>
+        <li><strong>Adversarial &amp; false-alarm calibration:</strong> Training mixes real outages with benign traffic spikes (where any write action incurs a false-positive penalty), upstream third-party outages requiring human escalation, and prompt-injection strings embedded inside container logs.</li>
+      </ul>
+
+      <figure>
+        <img src="assets/omnisre_architecture.png" alt="OmniSRE five-stage read-before-write agent loop and 64-layer 3:1 hybrid backbone" />
+        <figcaption><strong>FIGURE 1</strong> Five-stage read-before-write incident loop paired with the 64-layer <code>3 : 1</code> hybrid <code>Qwen3.8-27B</code> backbone (<code>48</code> Gated DeltaNet linear-attention layers + <code>16</code> Gated Attention layers).</figcaption>
+      </figure>
+
+      <h2 id="architecture"><span class="sec-no">SECTION 02</span>Hybrid 27B Backbone, Validated Corpus &amp; SFT Warm-Start</h2>
+      <h3>Full-Backbone Hybrid LoRA Discovery</h3>
+      <p>
+        <code>Qwen/Qwen3.8-27B</code> interleaves <code>48</code> linear-complexity <strong>Gated DeltaNet</strong> blocks with <code>16</code> full <strong>Gated Attention</strong> blocks across 64 layers (<code>262K</code> native context window, ~<code>2 GB</code> FP8 KV cache at <code>64K</code> tokens). Naive LoRA recipes that target only <code>q_proj/k_proj/v_proj/o_proj</code> leave 75% of the temporal state-mixing layers frozen. Our target discovery module (<code>src/sre_rl/model/qwen38_lora.py</code>) attaches Rank-64 adapters across <em>both</em> Gated DeltaNet projections (<code>in_proj_qkv</code>, <code>in_proj_z</code>, <code>in_proj_a</code>, <code>in_proj_b</code>, <code>out_proj</code>) and Gated Attention + SwiGLU MLP projections (<code>466.9M</code> trainable parameters, <code>1.68%</code> of backbone), while keeping the vision tower and multi-token prediction head frozen.
+      </p>
+
+      <h3>Five-Gate Validated Open SRE Corpus &amp; Two-Phase SFT</h3>
+      <p>
+        Before reinforcement learning, we curate and validate <strong>5,038 multi-turn SRE trajectories</strong> and <strong>2,046 production runbook &amp; PromQL alert documents</strong> from permissively licensed sources, passing five automated gates: zero PII/secret leaks after regex+entropy scrubbing, 100% tool-call JSON schema validity, <code>200/200</code> oracle solvability, zero scenario/topology/prompt overlap against held-out splits, and explicit adversarial safety balance.
+      </p>
+
+      <figure>
+        <img src="assets/omnisre_dataset_infographic.png" alt="Open SRE corpus composition and five validation gates" />
+        <figcaption><strong>FIGURE 2</strong> Composition of the open SRE warm-start corpus and the five pre-training validation gates (zero PII leaks, zero train/eval topology contamination).</figcaption>
+      </figure>
+
+      <p>
+        Supervised warm-start proceeds in two stages on <code>4 &times; H100</code> GPUs: <strong>Stage&nbsp;1a</strong> trains across all <code>5,038</code> general SRE trajectories (<code>157</code> steps, cross-entropy loss <code>3.34 &rarr; 0.175</code>), followed by <strong>Phase&nbsp;1b</strong> exact-schema calibration on <code>1,559</code> multi-turn tool traces (<code>98</code> steps, loss <code>0.057</code>, <code>98.5%</code> per-token accuracy). Prior SFT adapters are cleanly merged into BF16 base tensors before attaching fresh FP32-master RLVR adapters.
+      </p>
+
+      <figure>
+        <img src="assets/omnisre_training_curves.png" alt="Stage 1a and Phase 1b supervised warm-start loss and token accuracy" />
+        <figcaption><strong>FIGURE 3</strong> Stage 1a and Phase 1b supervised warm-start loss (log scale) and mean per-token accuracy prior to on-policy RLVR.</figcaption>
+      </figure>
+
+      <h2 id="rlvr"><span class="sec-no">SECTION 03</span>Multi-World On-Policy RLVR Architecture</h2>
+      <p>
+        Building on recent findings in large-scale agentic RLVR (including ResolveAI's <em>SRE-1</em> ablations), our <code>v1.0</code> trainer (<code>scripts/train_rl_v1_omnisre_4xh100.py</code>) runs a split-GPU architecture on a single <code>4 &times; H100 80GB</code> node: <strong>GPUs 0,1</strong> serve <code>SGLang 0.5.23</code> TP2 with FP8 KV cache and FlashInfer, while <strong>GPUs 2,3</strong> run DistributedDataParallel policy updates with BF16 autocast and FP32 master weights, gradients, and chunked FP32 log-softmax heads.
+      </p>
+
+      <div class="formula">
+        L_CISPO(&theta;) = - (1 / |T_valid|) &sum;_{t &in; T_valid} sg(r_t(&theta;)) &middot; A_t^GTPO &middot; log &pi;_&theta;(a_t | s_t), &nbsp;&nbsp; T_valid = { t : m_t = 1 &and; r_t(&theta;) &in; [0.2, 5.0] }, &nbsp;&nbsp; &beta;_KL = 0
+      </div>
+
+      <ul>
+        <li><strong>Native Token-In-Token-Out (<code>TITO</code>) Rollouts:</strong> Multi-turn trajectories append exact token IDs directly to SGLang's <code>/generate</code> endpoint without decode/re-encode text round-trips, eliminating BPE boundary mismatches between rollout and trainer log-probabilities.</li>
+        <li><strong>Masked CISPO + Turn-Level GTPO Credit Assignment:</strong> Out-of-band importance ratios (<code>r_t &notin; [0.2, 5.0]</code>) are hard-masked from the gradient rather than clipped, paired with zero KL penalty (<code>&beta; = 0</code>) and discounted turn-shaping advantages (<code>&gamma; = 0.92</code>) strictly masked over assistant tokens.</li>
+        <li><strong>Clean Zero-Copy On-Policy SGLang Sync:</strong> Every 2 steps (<code>max_staleness &le; 2</code>), PEFT weights are merged into a stripped canonical <code>state_dict</code> (<code>1,184</code> tensors, zero residual <code>.base_layer</code> or <code>.lora_*</code> keys) and hot-reloaded via SGLang's <code>/update_weights_from_disk</code>.</li>
+        <li><strong>Multi-World Batch Mix &amp; <code>60%</code> MCP Tool-Schema Randomization:</strong> Every RLVR step mixes <strong>50% real recorded production telemetry</strong> (<code>837</code> incidents from <code>DejaVu-A1/A2/B</code> commercial bank/cloud systems + <code>RCAEval RE1/RE2/RE3</code> GKE captures, backed by an in-memory <code>&lt;3ms</code> <code>np.searchsorted</code> time-series cache), <strong>25% safety-gated K8s write remediation</strong>, and <strong>25% offline evidence synthesis</strong>. Across 60% of rollout groups, canonical tool names and turn/token budgets are randomized across Datadog, PromQL, Grafana, Loki, Splunk, Jaeger, PagerDuty, and <code>kubectl</code> conventions to force genuine schema-agnostic transfer.</li>
+      </ul>
+
+      <h2 id="benchmarks"><span class="sec-no">SECTION 04</span>Zero-Contamination Empirical Evaluation</h2>
+      <p>
+        We evaluate the standalone merged BF16 <strong>OmniSRE v1.0</strong> checkpoint (<a href="https://huggingface.co/w3joe/OmniSRE"><code>w3joe/OmniSRE</code></a>, locked at the <code>step_100</code> held-out peak) head-to-head against unmodified <strong>Base <code>Qwen/Qwen3.8-27B</code></strong> under identical SGLang TP2 serving across systems and topologies completely unseen during SFT and RLVR:
+      </p>
+      <ol>
+        <li><strong>Unseen K8s Read-Before-Write Remediation (<code>60</code> unseen topologies &times; <code>3</code> runs = <code>180</code> episodes/model):</strong> Held-out OpenShift, <code>kube-prometheus</code>, and metastable failure scenarios requiring multi-step read verification prior to remediation.</li>
+        <li><strong>All <code>129</code> Unseen Real Production Outages:</strong> Every incident from two held-out production corpora never seen during training — <strong><code>DejaVu-C</code></strong> (<code>99</code> real commercial Oracle database wait-event outages: redo log sync, row lock contention, global cache buffer busy) and <strong><code>RCAEval RE3-TT</code></strong> (<code>30</code> real GKE multi-modal failures across the 41-microservice Train Ticket system) — plus <strong><code>5&times;</code> Hierarchical Tree Ensemble (<code>2 + 3 &rarr; 1</code>)</strong> evaluation.</li>
+      </ol>
+
+      <figure>
+        <img src="assets/omnisre_benchmarks.png" alt="OmniSRE v1.0 vs Base Qwen3.8-27B benchmark bars and RLVR training curve" />
+        <figcaption><strong>FIGURE 4</strong> Left: zero-contamination benchmark comparison between <code>OmniSRE v1.0</code> and Base <code>Qwen/Qwen3.8-27B</code>. Right: on-policy Masked CISPO held-out progression from Step 0 to Step 100, lifting unseen real incident resolution from <code>22.5% &rarr; 92.5%</code> while compressing investigation length from <code>20.1 &rarr; 3.7</code> turns.</figcaption>
+      </figure>
+
+      <h3>Table 1 — Unseen Policy-Gated Kubernetes Write Remediation (60 Topologies &times; 3 Runs)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th class="num">Pass@1 (temp=0)</th>
+              <th class="num">Pass@3</th>
+              <th class="num">Pass^3 (3/3 Consistent)</th>
+              <th class="num">Safety Viol. (Greedy)</th>
+              <th class="num">Avg Turns</th>
+              <th class="num">Wall Time</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>Qwen/Qwen3.8-27B</code> (Base)</td>
+              <td class="num">30.0%</td>
+              <td class="num">71.7%</td>
+              <td class="num">6.7%</td>
+              <td class="num">0.0%</td>
+              <td class="num">13.07</td>
+              <td class="num">355.5s</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong><code>OmniSRE-27B v1.0</code> (Ours)</strong></td>
+              <td class="num"><span class="gain">98.3%</span></td>
+              <td class="num"><span class="gain">100.0%</span></td>
+              <td class="num"><span class="gain">88.3%</span></td>
+              <td class="num">0.0%</td>
+              <td class="num">6.99</td>
+              <td class="num">108.7s</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Table 2 — All 129 Unseen Real Production Outages (<code>DejaVu-C</code> Oracle DB + <code>RE3-TT</code> 41-Service K8s)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Held-Out Corpus</th>
+              <th class="num">Cases</th>
+              <th>Model / Mode</th>
+              <th class="num">Root-Service Exact</th>
+              <th class="num">Solved Rate</th>
+              <th class="num">Mean Reward</th>
+              <th class="num">Avg Turns</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>All Unseen Real Combined</td>
+              <td class="num">129</td>
+              <td><code>Qwen/Qwen3.8-27B</code> (Base, 1&times;)</td>
+              <td class="num">87.6%</td>
+              <td class="num">73.6%</td>
+              <td class="num">0.394</td>
+              <td class="num">14.59</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong>All Unseen Real Combined</strong></td>
+              <td class="num">129</td>
+              <td><strong><code>OmniSRE-27B v1.0</code> (1&times; Greedy)</strong></td>
+              <td class="num"><span class="gain">99.2% (128/129)</span></td>
+              <td class="num"><span class="gain">75.2%</span></td>
+              <td class="num"><span class="gain">0.744</span></td>
+              <td class="num"><span class="gain">4.07 (3.6&times; faster)</span></td>
+            </tr>
+            <tr>
+              <td><code>DejaVu-C</code> (Commercial Oracle DB)</td>
+              <td class="num">99</td>
+              <td><code>Qwen/Qwen3.8-27B</code> (Base, 1&times;)</td>
+              <td class="num">83.8%</td>
+              <td class="num">65.7%</td>
+              <td class="num">—</td>
+              <td class="num">15.49</td>
+            </tr>
+            <tr>
+              <td><code>DejaVu-C</code> (Commercial Oracle DB)</td>
+              <td class="num">99</td>
+              <td><code>OmniSRE-27B v1.0</code> (1&times; Greedy)</td>
+              <td class="num">99.0%</td>
+              <td class="num">67.7%</td>
+              <td class="num">—</td>
+              <td class="num">4.15</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong><code>DejaVu-C</code> (Stratified Slice)</strong></td>
+              <td class="num">20</td>
+              <td><strong><code>OmniSRE-27B v1.0</code> (5&times; Tree Ensemble)</strong></td>
+              <td class="num"><span class="gain">100.0%</span></td>
+              <td class="num"><span class="gain">75.0% (+5.0 pp vs 1&times;)</span></td>
+              <td class="num">—</td>
+              <td class="num">—</td>
+            </tr>
+            <tr>
+              <td><code>RCAEval RE3-TT</code> (41-Svc Train Ticket)</td>
+              <td class="num">30</td>
+              <td><code>Qwen/Qwen3.8-27B</code> (Base, 1&times;)</td>
+              <td class="num">100.0%</td>
+              <td class="num">100.0%</td>
+              <td class="num">—</td>
+              <td class="num">11.60</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong><code>RCAEval RE3-TT</code> (41-Svc Train Ticket)</strong></td>
+              <td class="num">30</td>
+              <td><strong><code>OmniSRE-27B v1.0</code> (1&times; Greedy)</strong></td>
+              <td class="num"><span class="gain">100.0%</span></td>
+              <td class="num"><span class="gain">100.0%</span></td>
+              <td class="num">—</td>
+              <td class="num"><span class="gain">3.80 (3.1&times; faster)</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="ablations"><span class="sec-no">SECTION 05</span>Training Dynamics, Engineering Lessons &amp; Open Limitations</h2>
+      <p>
+        Tracking stratified unseen held-out evaluations every 25 RLVR steps surfaced two critical engineering phenomena that shaped <code>v1.0</code> and inform our <code>v2.0</code> roadmap:
+      </p>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>RLVR Stage</th>
+              <th class="num">Unseen <code>DejaVu-C</code> (n=20)</th>
+              <th class="num">Unseen <code>RE3-TT</code> (n=20)</th>
+              <th class="num">Combined Real Solved</th>
+              <th class="num">Root-Service Exact</th>
+              <th class="num">Write Fix (0% Safety)</th>
+              <th class="num">Avg Turns</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Step 0 (SFT + v5 Start)</td>
+              <td class="num">45.0%</td>
+              <td class="num">0.0%</td>
+              <td class="num">22.5%</td>
+              <td class="num">25.0%</td>
+              <td class="num">95.0%</td>
+              <td class="num">20.12</td>
+            </tr>
+            <tr>
+              <td>Step 25 (On-Policy CISPO)</td>
+              <td class="num">65.0%</td>
+              <td class="num">60.0%</td>
+              <td class="num">62.5%</td>
+              <td class="num">65.0%</td>
+              <td class="num">100.0%</td>
+              <td class="num">11.10</td>
+            </tr>
+            <tr>
+              <td>Step 50</td>
+              <td class="num">65.0%</td>
+              <td class="num">90.0%</td>
+              <td class="num">77.5%</td>
+              <td class="num">92.5%</td>
+              <td class="num">95.0%</td>
+              <td class="num">4.75</td>
+            </tr>
+            <tr>
+              <td>Step 75</td>
+              <td class="num">70.0%</td>
+              <td class="num">90.0%</td>
+              <td class="num">80.0%</td>
+              <td class="num">95.0%</td>
+              <td class="num">85.0%</td>
+              <td class="num">4.22</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong>Step 100 (<code>v1.0</code> Selected Peak)</strong></td>
+              <td class="num"><span class="gain">85.0%</span></td>
+              <td class="num"><span class="gain">100.0%</span></td>
+              <td class="num"><span class="gain">92.5%</span></td>
+              <td class="num"><span class="gain">100.0%</span></td>
+              <td class="num"><span class="gain">95.0%</span></td>
+              <td class="num"><span class="gain">3.70</span></td>
+            </tr>
+            <tr>
+              <td>Step 150 (Post-Epoch-1 Drift)</td>
+              <td class="num">60.0%</td>
+              <td class="num">100.0%</td>
+              <td class="num">80.0%</td>
+              <td class="num">100.0%</td>
+              <td class="num">95.0%</td>
+              <td class="num">3.58</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout-note">
+        <strong>Transparent Limitations &amp; Active Work:</strong> (1) After completing one full pass over the <code>837</code> real telemetry incidents (~Step 130), zero-KL Masked CISPO under a constant <code>3e-6</code> learning rate retained <code>100%</code> service localization but exhibited fault-subtype entropy collapse on <code>DejaVu-C</code> (<code>85% &rarr; 60%</code>), motivating checkpoint selection at <code>step_100</code> and cosine LR + fault-stratified sampling for <code>v2.0</code>. (2) When provided pre-ranked z-score anomaly summaries at exact fault onset, Base <code>Qwen3.8-27B</code> already reaches <code>73.6%</code> (albeit <code>3.6&times;</code> slower); external evaluations on raw code-execution <code>microsoft/OpenRCA</code> CSVs and live containerized <code>SREGym-Lite</code> Kubernetes clusters are actively running to measure performance without pre-aggregated metric summaries.
+      </div>
+
+      <h2 id="quickstart"><span class="sec-no">SECTION 06</span>Self-Hosting Quickstart &amp; Citation</h2>
+      <p>
+        The standalone merged BF16 weights (<a href="https://huggingface.co/w3joe/OmniSRE"><code>w3joe/OmniSRE</code></a>) require no PEFT adapter merging at load time and serve directly via SGLang, vLLM, or Hugging Face <code>transformers</code>.
+      </p>
+
+      <h3>1. Production Serving with SGLang (<code>1 &times; H100</code> / <code>L40S</code> FP8 KV)</h3>
+      <pre><code>python3 -m sglang.launch_server \
+  --model-path w3joe/OmniSRE \
+  --served-model-name omnisre-27b \
+  --trust-remote-code \
+  --kv-cache-dtype fp8_e4m3 \
+  --attention-backend flashinfer \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen3_coder</code></pre>
+
+      <h3>2. Direct Inference with <code>transformers</code></h3>
+      <pre><code>import torch
+from transformers import AutoModelForImageTextToText, AutoTokenizer
+
+model_id = "w3joe/OmniSRE"
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForImageTextToText.from_pretrained(
+    model_id, dtype=torch.bfloat16, device_map="auto", trust_remote_code=True
+)</code></pre>
+
+      <h3>3. Citation</h3>
+      <pre><code>@misc{omnisre2026,
+  title        = {OmniSRE-27B: Read-Before-Write Reinforcement Learning with Verifiable Rewards for Autonomous Site Reliability Engineering},
+  author       = {OmniSRE Contributors},
+  year         = {2026},
+  howpublished = {\url{https://huggingface.co/w3joe/OmniSRE}},
+  note         = {Code and RLVR pipeline at \url{https://github.com/w3joe/OmniSRE}}
+}</code></pre>
+
+      <footer>
+        <div><strong>OmniSRE-27B</strong> · Released under Apache License 2.0</div>
+        <div>
+          <a href="https://huggingface.co/w3joe/OmniSRE">Hugging Face Weights</a> &middot;
+          <a href="https://github.com/w3joe/OmniSRE">GitHub Repository</a>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+</body>
+</html>
