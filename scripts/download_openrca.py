@@ -61,7 +61,8 @@ def index_openrca_directory(openrca_root: Path, out_dir: Path) -> dict[str, obje
                     or row.get("start_time")
                     or ""
                 )
-                ts = _parse_iso_or_unix(raw_ts)
+                dt_col = str(row.get("datetime") or row.get("start_time") or "").strip()
+                ts = _parse_iso_or_unix(raw_ts) or _parse_iso_or_unix(dt_col)
                 root_svc = str(
                     row.get("component")
                     or row.get("root_cause_component")
@@ -77,14 +78,19 @@ def index_openrca_directory(openrca_root: Path, out_dir: Path) -> dict[str, obje
                 if not root_svc:
                     continue
 
-                # Locate matching date-partitioned telemetry folder if present
-                date_str = raw_ts[:10].replace("/", "_") if len(raw_ts) >= 10 else ""
+                # Locate matching date-partitioned telemetry folder (`YYYY_MM_DD`) using `datetime` column!
+                date_str = dt_col[:10].replace("-", "_").replace("/", "_") if len(dt_col) >= 10 else ""
                 day_dir = telemetry_dir / date_str if date_str and (telemetry_dir / date_str).exists() else telemetry_dir
                 metric_files = sorted(day_dir.rglob("*metric*.csv")) if day_dir.exists() else []
+                # Prefer `metric_container.csv` / `metric_service.csv` over app-level summary `metric_app.csv`
+                preferred_metrics = [
+                    p for p in metric_files if "container" in p.name or "service" in p.name or "node" in p.name
+                ]
+                chosen_metric = preferred_metrics[0] if preferred_metrics else (metric_files[0] if metric_files else None)
                 log_files = sorted(day_dir.rglob("*log*.csv")) if day_dir.exists() else []
                 trace_files = sorted(day_dir.rglob("*trace*.csv")) if day_dir.exists() else []
 
-                if not metric_files and not log_files and not trace_files:
+                if chosen_metric is None and not log_files and not trace_files:
                     continue
 
                 rec = RealIncidentRecord(
@@ -94,7 +100,7 @@ def index_openrca_directory(openrca_root: Path, out_dir: Path) -> dict[str, obje
                     inject_timestamp=ts,
                     ground_truth_service=root_svc,
                     ground_truth_fault=fault_type,
-                    metrics_path=str(metric_files[0]) if metric_files else "",
+                    metrics_path=str(chosen_metric) if chosen_metric else "",
                     logs_path=str(log_files[0]) if log_files else None,
                     traces_path=str(trace_files[0]) if trace_files else None,
                     is_dejavu_long_format=False,

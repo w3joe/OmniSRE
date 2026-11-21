@@ -29,6 +29,7 @@ import datetime as dt
 import json
 import random
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,118 @@ from sre_rl.env.real_telemetry_env import (
 from sre_rl.model.thinking import parse_qwen38_assistant_turn_multi
 from sre_rl.schemas import ToolCall
 
-# 65+ Enterprise Tool Registry (mix of core observability tools + realistic enterprise distractors)
+# Thread-safe in-RAM parsed CSV cache for 192+ concurrent rollout workers on 8x H100
+_V2_CACHE_LOCK = threading.Lock()
+_V2_FILE_LOCKS: dict[str, threading.Lock] = {}
+_V2_METRICS_CACHE: dict[str, tuple[np.ndarray, list[tuple[int, str, str, float]], set[str]]] = {}
+
+
+def _get_or_parse_v2_metrics_file(
+    rec: RealIncidentRecord,
+) -> tuple[np.ndarray, list[tuple[int, str, str, float]], set[str]]:
+    raw_p = Path(rec.metrics_path) if rec.metrics_path else None
+    if raw_p is None:
+        return np.zeros(0, dtype=np.int64), [], set()
+
+    if rec.is_dejavu_long_format:
+        norm_p = raw_p.with_name("metrics.norm.csv")
+        target = norm_p if norm_p.exists() else raw_p
+    else:
+        mpath = Path(rec.simple_metrics_path or rec.metrics_path)
+        target = mpath if mpath.exists() else raw_p
+
+    if not target.exists():
+        return np.zeros(0, dtype=np.int64), [], set()
+
+    default_host = rec.single_entity_alert_host or rec.ground_truth_service or "db-primary"
+    cache_key = f"{target}::{default_host if rec.is_dejavu_long_format else ''}"
+    with _V2_CACHE_LOCK:
+        hit = _V2_METRICS_CACHE.get(cache_key)
+        if hit is not None:
+            return hit
+        flock = _V2_FILE_LOCKS.setdefault(cache_key, threading.Lock())
+
+    with flock:
+        with _V2_CACHE_LOCK:
+            hit = _V2_METRICS_CACHE.get(cache_key)
+            if hit is not None:
+                return hit
+
+        rows: list[tuple[int, str, str, float]] = []
+        svcs: set[str] = set()
+
+        # Detect OpenRCA directory (`metric_container.csv`, `metric_service.csv`, `metric_node.csv`)
+        if rec.source_dataset.startswith("OpenRCA-"):
+            sibling_csvs = sorted(target.parent.glob("metric_*.csv")) or [target]
+            for csv_f in sibling_csvs:
+                if "metric_app.csv" in csv_f.name and len(sibling_csvs) > 1:
+                    continue
+                with csv_f.open("r", encoding="utf-8", errors="ignore") as fh:
+                    for r in csv.DictReader(fh):
+                        ts = _parse_timestamp_to_unix(r.get("timestamp"))
+                        if ts is None:
+                            continue
+                        try:
+                            val = float(r.get("value", ""))
+                        except ValueError:
+                            continue
+                        if not np.isfinite(val):
+                            continue
+                        svc = str(r.get("cmdb_id") or r.get("service") or "unknown").strip()
+                        m_name = str(r.get("kpi_name") or r.get("name") or "kpi").strip()
+                        svcs.add(svc)
+                        rows.append((ts, svc, m_name, round(val, 5)))
+        elif rec.is_dejavu_long_format:
+            with target.open("r", encoding="utf-8", errors="ignore") as fh:
+                for r in csv.DictReader(fh):
+                    try:
+                        ts = int(float(r["timestamp"]))
+                        val = float(r["value"])
+                    except (KeyError, ValueError):
+                        continue
+                    if not np.isfinite(val):
+                        continue
+                    raw_name = str(r.get("name", "")).strip()
+                    if "##" in raw_name:
+                        p_svc, m_name = raw_name.split("##", 1)
+                        svc = p_svc or default_host
+                    else:
+                        svc, m_name = default_host, raw_name
+                    svcs.add(svc)
+                    rows.append((ts, svc, m_name, round(val, 5)))
+        else:
+            with target.open("r", encoding="utf-8", errors="ignore") as fh:
+                reader = csv.reader(fh)
+                header = next(reader, [])
+                cols = header[1:]
+                col_meta = [(c.split("_", 1)[0] if "_" in c else c, c) for c in cols]
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    try:
+                        ts = int(float(row[0]))
+                    except ValueError:
+                        continue
+                    for idx, raw_v in enumerate(row[1 : len(cols) + 1]):
+                        if not raw_v:
+                            continue
+                        try:
+                            v = float(raw_v)
+                        except ValueError:
+                            continue
+                        if np.isfinite(v):
+                            svc, m_name = col_meta[idx]
+                            svcs.add(svc)
+                            rows.append((ts, svc, m_name, round(v, 5)))
+
+        rows.sort(key=lambda x: x[0])
+        ts_arr = np.array([r[0] for r in rows], dtype=np.int64)
+        entry = (ts_arr, rows, svcs)
+        with _V2_CACHE_LOCK:
+            if len(_V2_METRICS_CACHE) > 64:
+                _V2_METRICS_CACHE.clear()
+            _V2_METRICS_CACHE[cache_key] = entry
+        return entry
 ENTERPRISE_TOOL_CATALOG: tuple[dict[str, str], ...] = (
     {"name": "discover_tools", "domain": "registry", "desc": "Search enterprise MCP tool registry by keyword or domain."},
     {"name": "list_tables_and_schemas", "domain": "observability", "desc": "Inspect available DuckDB telemetry tables (`metrics`, `logs`, `traces`) and column types."},
@@ -345,65 +457,17 @@ class RawDuckDBExplorationEnv:
     def _extract_real_metrics(
         rec: RealIncidentRecord, t_min: int, t_max: int
     ) -> tuple[list[tuple[int, str, str, float]], set[str]]:
-        rows: list[tuple[int, str, str, float]] = []
-        svcs: set[str] = set()
-        raw_p = Path(rec.metrics_path) if rec.metrics_path else None
-        if raw_p is None:
-            return rows, svcs
-        if rec.is_dejavu_long_format:
-            norm_p = raw_p.with_name("metrics.norm.csv")
-            target = norm_p if norm_p.exists() else raw_p
-            if not target.exists():
-                return rows, svcs
-            default_host = rec.single_entity_alert_host or rec.ground_truth_service or "db-primary"
-            with target.open("r", encoding="utf-8", errors="ignore") as fh:
-                for r in csv.DictReader(fh):
-                    try:
-                        ts = int(float(r["timestamp"]))
-                        val = float(r["value"])
-                    except (KeyError, ValueError):
-                        continue
-                    if ts < t_min or ts > t_max or not np.isfinite(val):
-                        continue
-                    raw_name = str(r.get("name", "")).strip()
-                    if "##" in raw_name:
-                        p_svc, m_name = raw_name.split("##", 1)
-                        svc = p_svc or default_host
-                    else:
-                        svc, m_name = default_host, raw_name
-                    svcs.add(svc)
-                    rows.append((ts, svc, m_name, round(val, 5)))
-        else:
-            mpath = Path(rec.simple_metrics_path or rec.metrics_path)
-            target = mpath if mpath.exists() else raw_p
-            if not target.exists():
-                return rows, svcs
-            with target.open("r", encoding="utf-8", errors="ignore") as fh:
-                reader = csv.reader(fh)
-                header = next(reader, [])
-                cols = header[1:]
-                col_meta = [(c.split("_", 1)[0] if "_" in c else c, c) for c in cols]
-                for row in reader:
-                    if len(row) < 2:
-                        continue
-                    try:
-                        ts = int(float(row[0]))
-                    except ValueError:
-                        continue
-                    if ts < t_min or ts > t_max:
-                        continue
-                    for idx, raw_v in enumerate(row[1 : len(cols) + 1]):
-                        if not raw_v:
-                            continue
-                        try:
-                            v = float(raw_v)
-                        except ValueError:
-                            continue
-                        if np.isfinite(v):
-                            svc, m_name = col_meta[idx]
-                            svcs.add(svc)
-                            rows.append((ts, svc, m_name, round(v, 5)))
-        return rows, svcs
+        ts_arr, all_rows, svcs = _get_or_parse_v2_metrics_file(rec)
+        if ts_arr.size == 0:
+            return [], set()
+        i0 = int(np.searchsorted(ts_arr, t_min, side="left"))
+        i1 = int(np.searchsorted(ts_arr, t_max, side="right"))
+        sliced = all_rows[i0:i1]
+        # Bound ultra-dense OpenRCA day tables to <=25,000 rows via uniform stride if needed
+        if len(sliced) > 25_000:
+            stride = max(1, len(sliced) // 25_000)
+            sliced = sliced[::stride]
+        return sliced, set(svcs)
 
     @staticmethod
     def _extract_real_logs(
