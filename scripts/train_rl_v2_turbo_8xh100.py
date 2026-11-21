@@ -181,6 +181,8 @@ def rollout_v2_raw_compacted_tito(
                     segments_raw.append((list(token_stream), list(cur_spans), list(cur_rewards)))
                 cur_spans, cur_rewards = [], []
                 env.workspace.compactions_performed += 1
+                for recent_obs in key_obs[-3:]:
+                    env.workspace.confirmed_anomalies.append(recent_obs[:220])
                 token_stream = _start_fresh_segment(env.render_initial_alert())
 
             out_ids, raw_txt = _sglang_generate_tito(
@@ -380,7 +382,7 @@ def main() -> None:
     sglang_urls = [u.strip() for u in args.sglang_urls.split(",") if u.strip()]
     url_cycle = itertools.cycle(sglang_urls)
 
-    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=45))
+    dist.init_process_group(backend="nccl", timeout=datetime.timedelta(minutes=90))
     local_rank = int(os.environ["LOCAL_RANK"])
     world_size = dist.get_world_size()
     device = torch.device(f"cuda:{local_rank}")
@@ -438,7 +440,7 @@ def main() -> None:
         eval_slice.extend(sub[: max(1, 30 // max(1, len(by_ho)))])
 
     counterfactual_bank: list[tuple[RealIncidentRecord, list[LeafInvestigationArtifact]]] = []
-    dapo_cfg = DAPOConfig(group_size=args.group_size, gamma=0.92, outcome_dampening_lambda=0.30, min_group_max_reward=0.40)
+    dapo_cfg = DAPOConfig(group_size=args.group_size, gamma=0.92, outcome_dampening_lambda=0.30, min_group_max_reward=0.15)
 
     def _sample_stratified_records(n: int) -> list[RealIncidentRecord]:
         keys = sorted(fault_buckets.keys())
@@ -525,7 +527,7 @@ def main() -> None:
                     counterfactual_bank.append((rec, leaves))
                     if len(counterfactual_bank) > 400:
                         counterfactual_bank.pop(0)
-                if float(np.std(rews)) >= dapo_cfg.min_group_std and float(np.max(rews)) >= 0.40:
+                if float(np.std(rews)) >= dapo_cfg.min_group_std and float(np.max(rews)) >= 0.15:
                     scored_groups.append((float(np.std(rews)), cp))
 
             scored_groups.sort(key=lambda x: x[0], reverse=True)

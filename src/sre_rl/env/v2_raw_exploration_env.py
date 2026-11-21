@@ -36,6 +36,7 @@ from typing import Any
 
 import duckdb
 import numpy as np
+import pyarrow as pa
 
 from sre_rl.env.output_limiter import bound_tool_output
 from sre_rl.env.real_telemetry_env import (
@@ -50,6 +51,89 @@ from sre_rl.schemas import ToolCall
 _V2_CACHE_LOCK = threading.Lock()
 _V2_FILE_LOCKS: dict[str, threading.Lock] = {}
 _V2_METRICS_CACHE: dict[str, tuple[np.ndarray, list[tuple[int, str, str, float]], set[str]]] = {}
+_V2_LOGS_CACHE: dict[str, tuple[np.ndarray, list[tuple[int, str, str, str]]]] = {}
+_V2_TRACES_CACHE: dict[str, tuple[np.ndarray, list[tuple[int, str, str, str, str, str, float, str]]]] = {}
+
+
+def _get_or_parse_v2_logs_file(logs_path: str | None) -> tuple[np.ndarray, list[tuple[int, str, str, str]]]:
+    if not logs_path or not Path(logs_path).exists():
+        return np.zeros(0, dtype=np.int64), []
+    with _V2_CACHE_LOCK:
+        hit = _V2_LOGS_CACHE.get(logs_path)
+        if hit is not None:
+            return hit
+        flock = _V2_FILE_LOCKS.setdefault(f"log::{logs_path}", threading.Lock())
+    with flock:
+        with _V2_CACHE_LOCK:
+            hit = _V2_LOGS_CACHE.get(logs_path)
+            if hit is not None:
+                return hit
+        rows: list[tuple[int, str, str, str]] = []
+        with Path(logs_path).open("r", encoding="utf-8", errors="ignore") as fh:
+            for idx, r in enumerate(csv.DictReader(fh)):
+                if idx >= 50_000:
+                    break
+                ts = _parse_timestamp_to_unix(r.get("timestamp", ""))
+                if ts is None:
+                    continue
+                svc = str(r.get("container_name") or r.get("service") or r.get("cmdb_id") or "unknown")
+                lvl = str(r.get("level") or r.get("log_name") or "INFO")
+                msg = str(r.get("message") or r.get("value") or "")[:240]
+                rows.append((ts, svc, lvl, msg))
+        rows.sort(key=lambda x: x[0])
+        ts_arr = np.array([r[0] for r in rows], dtype=np.int64)
+        entry = (ts_arr, rows)
+        with _V2_CACHE_LOCK:
+            if len(_V2_LOGS_CACHE) > 64:
+                _V2_LOGS_CACHE.clear()
+            _V2_LOGS_CACHE[logs_path] = entry
+        return entry
+
+
+def _get_or_parse_v2_traces_file(
+    traces_path: str | None,
+) -> tuple[np.ndarray, list[tuple[int, str, str, str, str, str, float, str]]]:
+    if not traces_path or not Path(traces_path).exists():
+        return np.zeros(0, dtype=np.int64), []
+    with _V2_CACHE_LOCK:
+        hit = _V2_TRACES_CACHE.get(traces_path)
+        if hit is not None:
+            return hit
+        flock = _V2_FILE_LOCKS.setdefault(f"trc::{traces_path}", threading.Lock())
+    with flock:
+        with _V2_CACHE_LOCK:
+            hit = _V2_TRACES_CACHE.get(traces_path)
+            if hit is not None:
+                return hit
+        rows: list[tuple[int, str, str, str, str, str, float, str]] = []
+        with Path(traces_path).open("r", encoding="utf-8", errors="ignore") as fh:
+            for idx, r in enumerate(csv.DictReader(fh)):
+                if idx >= 60_000:
+                    break
+                ts = _parse_timestamp_to_unix(r.get("startTimeMillis") or r.get("startTime") or r.get("timestamp"))
+                if ts is None:
+                    continue
+                tid = str(r.get("traceID") or r.get("trace_id") or "")
+                sid = str(r.get("spanID") or r.get("span_id") or "")
+                pid = str(r.get("parentSpanID") or r.get("parent_id") or "")
+                svc = str(r.get("serviceName") or r.get("cmdb_id") or "unknown")
+                op = str(r.get("operationName") or r.get("methodName") or "op")[:80]
+                try:
+                    dur_ms = float(r.get("duration", 0.0))
+                    if dur_ms > 100_000:
+                        dur_ms /= 1000.0
+                except ValueError:
+                    dur_ms = 0.0
+                st = str(r.get("statusCode") or r.get("status_code") or "200")
+                rows.append((ts, tid, sid, pid, svc, op, round(dur_ms, 3), st))
+        rows.sort(key=lambda x: x[0])
+        ts_arr = np.array([r[0] for r in rows], dtype=np.int64)
+        entry = (ts_arr, rows)
+        with _V2_CACHE_LOCK:
+            if len(_V2_TRACES_CACHE) > 64:
+                _V2_TRACES_CACHE.clear()
+            _V2_TRACES_CACHE[traces_path] = entry
+        return entry
 
 
 def _get_or_parse_v2_metrics_file(
@@ -333,7 +417,7 @@ class RawDuckDBExplorationEnv:
         self,
         config: HaystackConfig | None = None,
         seed: int = 42,
-        max_output_chars: int = 3200,
+        max_output_chars: int = 1800,
     ) -> None:
         self.cfg = config or HaystackConfig()
         self.rng = random.Random(seed)
@@ -417,19 +501,45 @@ class RawDuckDBExplorationEnv:
         mapped_metrics.extend(distractor_metrics)
         mapped_logs.extend(distractor_logs)
 
+        # Register zero-copy PyArrow tables into DuckDB (~10ms vs 7,000ms executemany; releases Python GIL!)
         con = duckdb.connect(":memory:")
-        con.execute("CREATE TABLE metrics (ts BIGINT, service VARCHAR, metric VARCHAR, value DOUBLE)")
-        con.execute("CREATE TABLE logs (ts BIGINT, service VARCHAR, level VARCHAR, message VARCHAR)")
-        con.execute(
-            "CREATE TABLE traces (ts BIGINT, trace_id VARCHAR, span_id VARCHAR, parent_id VARCHAR, "
-            "service VARCHAR, operation VARCHAR, duration_ms DOUBLE, status_code VARCHAR)"
+        m_tbl = pa.table(
+            {
+                "ts": pa.array([r[0] for r in mapped_metrics], type=pa.int64()),
+                "service": pa.array([r[1] for r in mapped_metrics], type=pa.string()),
+                "metric": pa.array([r[2] for r in mapped_metrics], type=pa.string()),
+                "value": pa.array([r[3] for r in mapped_metrics], type=pa.float64()),
+            }
         )
-        if mapped_metrics:
-            con.executemany("INSERT INTO metrics VALUES (?, ?, ?, ?)", mapped_metrics)
-        if mapped_logs:
-            con.executemany("INSERT INTO logs VALUES (?, ?, ?, ?)", mapped_logs)
-        if mapped_traces:
-            con.executemany("INSERT INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?)", mapped_traces)
+        l_tbl = pa.table(
+            {
+                "ts": pa.array([r[0] for r in mapped_logs], type=pa.int64()),
+                "service": pa.array([r[1] for r in mapped_logs], type=pa.string()),
+                "level": pa.array([r[2] for r in mapped_logs], type=pa.string()),
+                "message": pa.array([r[3] for r in mapped_logs], type=pa.string()),
+            }
+        )
+        t_tbl = pa.table(
+            {
+                "ts": pa.array([r[0] for r in mapped_traces], type=pa.int64()),
+                "trace_id": pa.array([r[1] for r in mapped_traces], type=pa.string()),
+                "span_id": pa.array([r[2] for r in mapped_traces], type=pa.string()),
+                "parent_id": pa.array([r[3] for r in mapped_traces], type=pa.string()),
+                "service": pa.array([r[4] for r in mapped_traces], type=pa.string()),
+                "operation": pa.array([r[5] for r in mapped_traces], type=pa.string()),
+                "duration_ms": pa.array([r[6] for r in mapped_traces], type=pa.float64()),
+                "status_code": pa.array([r[7] for r in mapped_traces], type=pa.string()),
+            }
+        )
+        con.register("_m_arrow", m_tbl)
+        con.register("_l_arrow", l_tbl)
+        con.register("_t_arrow", t_tbl)
+        con.execute("CREATE TABLE metrics AS SELECT * FROM _m_arrow")
+        con.execute("CREATE TABLE logs AS SELECT * FROM _l_arrow")
+        con.execute("CREATE TABLE traces AS SELECT * FROM _t_arrow")
+        con.unregister("_m_arrow")
+        con.unregister("_l_arrow")
+        con.unregister("_t_arrow")
 
         # Hardware-grade DuckDB lockdown: block ALL external file / env / extension access!
         con.execute("SET enable_external_access = false")
@@ -473,50 +583,25 @@ class RawDuckDBExplorationEnv:
     def _extract_real_logs(
         rec: RealIncidentRecord, t_min: int, t_max: int
     ) -> list[tuple[int, str, str, str]]:
-        out: list[tuple[int, str, str, str]] = []
-        if not rec.logs_path or not Path(rec.logs_path).exists():
-            return out
-        with Path(rec.logs_path).open("r", encoding="utf-8", errors="ignore") as fh:
-            for idx, r in enumerate(csv.DictReader(fh)):
-                if idx >= 40_000:
-                    break
-                ts = _parse_timestamp_to_unix(r.get("timestamp", ""))
-                if ts is not None and (ts < t_min or ts > t_max):
-                    continue
-                svc = str(r.get("container_name") or r.get("service") or r.get("cmdb_id") or "unknown")
-                lvl = str(r.get("level") or "INFO")
-                msg = str(r.get("message") or r.get("value") or "")[:260]
-                out.append((ts or t_min, svc, lvl, msg))
-        return out
+        ts_arr, rows = _get_or_parse_v2_logs_file(rec.logs_path)
+        if ts_arr.size == 0:
+            return []
+        i0 = int(np.searchsorted(ts_arr, t_min, side="left"))
+        i1 = int(np.searchsorted(ts_arr, t_max, side="right"))
+        sliced = rows[i0:i1]
+        return sliced[:6000] if len(sliced) > 6000 else sliced
 
     @staticmethod
     def _extract_real_traces(
         rec: RealIncidentRecord, t_min: int, t_max: int
     ) -> list[tuple[int, str, str, str, str, str, float, str]]:
-        out: list[tuple[int, str, str, str, str, str, float, str]] = []
-        if not rec.traces_path or not Path(rec.traces_path).exists():
-            return out
-        with Path(rec.traces_path).open("r", encoding="utf-8", errors="ignore") as fh:
-            for idx, r in enumerate(csv.DictReader(fh)):
-                if idx >= 50_000:
-                    break
-                ts = _parse_timestamp_to_unix(r.get("startTimeMillis") or r.get("startTime") or r.get("timestamp"))
-                if ts is not None and (ts < t_min or ts > t_max):
-                    continue
-                tid = str(r.get("traceID") or r.get("trace_id") or "")
-                sid = str(r.get("spanID") or r.get("span_id") or "")
-                pid = str(r.get("parentSpanID") or r.get("parent_id") or "")
-                svc = str(r.get("serviceName") or r.get("cmdb_id") or "unknown")
-                op = str(r.get("operationName") or r.get("methodName") or "op")[:80]
-                try:
-                    dur_ms = float(r.get("duration", 0.0))
-                    if dur_ms > 100_000:  # microseconds -> ms
-                        dur_ms /= 1000.0
-                except ValueError:
-                    dur_ms = 0.0
-                st = str(r.get("statusCode") or r.get("status_code") or "200")
-                out.append((ts or t_min, tid, sid, pid, svc, op, round(dur_ms, 3), st))
-        return out
+        ts_arr, rows = _get_or_parse_v2_traces_file(rec.traces_path)
+        if ts_arr.size == 0:
+            return []
+        i0 = int(np.searchsorted(ts_arr, t_min, side="left"))
+        i1 = int(np.searchsorted(ts_arr, t_max, side="right"))
+        sliced = rows[i0:i1]
+        return sliced[:8000] if len(sliced) > 8000 else sliced
 
     def _generate_distractor_haystack(
         self, t_min: int, t_max: int, n_distractors: int, use_aliasing: bool
