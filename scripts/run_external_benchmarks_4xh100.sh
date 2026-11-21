@@ -59,7 +59,9 @@ fi
 docker --version && kind --version && kubectl version --client && helm version
 
 echo "=== [2/6] Pulling OmniSRE v1.0 (51 GiB BF16) + Caching Base Qwen/Qwen3.8-27B ==="
-gcloud storage rsync -r "${GCS_BUCKET}/omnisre-v1.0/merged-27b-bf16" "${NVME_ROOT}/omnisre-v1.0" --quiet
+if [[ ! -f "${NVME_ROOT}/omnisre-v1.0/model.safetensors.index.json" ]]; then
+  gcloud storage rsync -r "${GCS_BUCKET}/omnisre-v1.0/merged-27b-bf16" "${NVME_ROOT}/omnisre-v1.0" --quiet
+fi
 "${NVME_ROOT}/venv-sglang/bin/python3" -c 'from huggingface_hub import snapshot_download; snapshot_download("Qwen/Qwen3.8-27B")'
 
 echo "=== [3/6] Launching Parallel 2+2 SGLang TP2 Servers (0.0.0.0:30000 OmniSRE | 0.0.0.0:30001 Base) ==="
@@ -106,25 +108,25 @@ OPENRCA_DIR="${NVME_ROOT}/ext_bench/OpenRCA"
 if [[ ! -d "${OPENRCA_DIR}" ]]; then
   git clone --depth 1 https://github.com/microsoft/OpenRCA.git "${OPENRCA_DIR}"
 fi
-uv venv "${NVME_ROOT}/venv-openrca" --python 3.11
-uv pip install --python "${NVME_ROOT}/venv-openrca/bin/python" -r "${OPENRCA_DIR}/requirements.txt" openai gdown pandas loguru nbformat pyyaml
+uv venv --clear "${NVME_ROOT}/venv-openrca" --python 3.11
+uv pip install --python "${NVME_ROOT}/venv-openrca/bin/python" -r "${OPENRCA_DIR}/requirements.txt" "numpy<2" openai huggingface_hub gdown pandas loguru nbformat pyyaml
 
 mkdir -p "${OPENRCA_DIR}/dataset"
 if gcloud storage ls "${GCS_BUCKET}/openrca-raw/READY" >/dev/null 2>&1; then
   echo "[openrca] Restoring cached OpenRCA dataset from GCS..."
   gcloud storage rsync -r "${GCS_BUCKET}/openrca-raw" "${OPENRCA_DIR}/dataset" --quiet
 else
-  echo "[openrca] Downloading OpenRCA dataset from Google Drive..."
-  "${NVME_ROOT}/venv-openrca/bin/gdown" --folder "1wGiEnu4OkWrjPxfx5ZTROnU37-5UDoPM" -O "${OPENRCA_DIR}/dataset" --remaining-ok || true
-  # Extract any compressed archives inside dataset/
-  find "${OPENRCA_DIR}/dataset" -maxdepth 3 -name "*.zip" -execdir unzip -q -o {} \; -delete || true
-  find "${OPENRCA_DIR}/dataset" -maxdepth 3 -name "*.tar.gz" -execdir tar -xzf {} \; -delete || true
-  find "${OPENRCA_DIR}/dataset" -maxdepth 3 -name "*.tgz" -execdir tar -xzf {} \; -delete || true
+  echo "[openrca] Downloading OpenRCA (Bank, Market, Telecom) via Hugging Face Hub (cdreetz/OpenRCA)..."
+  "${NVME_ROOT}/venv-sglang/bin/python3" - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download("cdreetz/OpenRCA", repo_type="dataset", local_dir="${OPENRCA_DIR}/dataset")
+PY
   if [[ -f "${OPENRCA_DIR}/dataset/Bank/query.csv" || -f "${OPENRCA_DIR}/dataset/Telecom/query.csv" || -f "${OPENRCA_DIR}/dataset/Market/cloudbed-1/query.csv" ]]; then
     echo "ok" | gcloud storage cp - "${GCS_BUCKET}/openrca-raw/READY" --quiet
     gcloud storage rsync -r "${OPENRCA_DIR}/dataset" "${GCS_BUCKET}/openrca-raw" --quiet || true
   fi
 fi
+sudo chmod -R a+rX "${OPENRCA_DIR}/dataset"
 
 docker build -t openrca-executor:local "${OPENRCA_DIR}/rca/baseline/rca_agent/sandbox"
 

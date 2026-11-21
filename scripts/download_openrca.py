@@ -139,11 +139,10 @@ def main() -> None:
                 ["git", "clone", "--depth", "1", "https://github.com/microsoft/OpenRCA.git", str(repo_dir)],
                 check=True,
             )
-        print(f"[openrca] Downloading OpenRCA Google Drive telemetry ({OPENRCA_GDRIVE_FOLDER_ID}) via gdown...")
-        subprocess.run(
-            ["gdown", "--folder", OPENRCA_GDRIVE_FOLDER_ID, "-O", str(repo_dir / "dataset"), "--remaining-ok"],
-            check=True,
-        )
+        print("[openrca] Downloading OpenRCA telemetry (Bank, Market, Telecom) from Hugging Face Hub (cdreetz/OpenRCA)...")
+        from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+
+        snapshot_download("cdreetz/OpenRCA", repo_type="dataset", local_dir=str(repo_dir / "dataset"))
 
     manifest = index_openrca_directory(repo_dir, args.out_dir)
     print(json.dumps(manifest, indent=2))
