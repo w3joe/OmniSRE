@@ -9,7 +9,12 @@ set -euo pipefail
 NVME_ROOT="${NVME_ROOT:-/mnt/nvme}"
 GCS_BUCKET="${GCS_BUCKET:-gs://onflow-30k-qwen38-sre-rl}"
 GCS_OUT="${GCS_OUT:-${GCS_BUCKET}/omnisre-v1.0/external-benchmarks}"
+OMNISRE_GCS_MODEL="${OMNISRE_GCS_MODEL:-${GCS_BUCKET}/omnisre-v1.0/merged-27b-bf16}"
+OMNISRE_MODEL_DIR="${OMNISRE_MODEL_DIR:-${NVME_ROOT}/omnisre-v1.0}"
+OMNISRE_SERVED_NAME="${OMNISRE_SERVED_NAME:-omnisre-27b-v1}"
+OMNISRE_TAG="${OMNISRE_TAG:-omnisre_v1}"
 OPENRCA_TASKS_PER_DS="${OPENRCA_TASKS_PER_DS:-15}"
+OPENRCA_WORKERS="${OPENRCA_WORKERS:-4}"
 SREGYM_TIMEOUT_S="${SREGYM_TIMEOUT_S:-480}"
 VM_NAME="${VM_NAME:-}"
 VM_ZONE="${VM_ZONE:-asia-northeast3-c}"
@@ -29,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${NVME_ROOT}/ext_bench" "${NVME_ROOT}/ext_results" "${NVME_ROOT}/omnisre-v1.0" "${NVME_ROOT}/docker"
+mkdir -p "${NVME_ROOT}/ext_bench" "${NVME_ROOT}/ext_results" "${OMNISRE_MODEL_DIR}" "${NVME_ROOT}/docker"
 
 echo "=== [1/6] Installing Docker >=25 (/mnt/nvme/docker), Kind v0.33.0, Kubectl, & Helm v4.3.2 ==="
 if ! command -v docker >/dev/null 2>&1; then
@@ -58,17 +63,17 @@ if ! command -v helm >/dev/null 2>&1; then
 fi
 docker --version && kind --version && kubectl version --client && helm version
 
-echo "=== [2/6] Pulling OmniSRE v1.0 (51 GiB BF16) + Caching Base Qwen/Qwen3.8-27B ==="
-if [[ ! -f "${NVME_ROOT}/omnisre-v1.0/model.safetensors.index.json" ]]; then
-  gcloud storage rsync -r "${GCS_BUCKET}/omnisre-v1.0/merged-27b-bf16" "${NVME_ROOT}/omnisre-v1.0" --quiet
+echo "=== [2/6] Pulling OmniSRE (${OMNISRE_GCS_MODEL}) + Caching Base Qwen/Qwen3.8-27B ==="
+if [[ ! -f "${OMNISRE_MODEL_DIR}/model.safetensors.index.json" ]]; then
+  gcloud storage rsync -r "${OMNISRE_GCS_MODEL}" "${OMNISRE_MODEL_DIR}" --quiet
 fi
 "${NVME_ROOT}/venv-sglang/bin/python3" -c 'from huggingface_hub import snapshot_download; snapshot_download("Qwen/Qwen3.8-27B")'
 
 echo "=== [3/6] Launching Parallel 2+2 SGLang TP2 Servers (0.0.0.0:30000 OmniSRE | 0.0.0.0:30001 Base) ==="
 PATH="${NVME_ROOT}/venv-sglang/bin:${PATH}" CUDA_VISIBLE_DEVICES=0,1 \
   "${NVME_ROOT}/venv-sglang/bin/python3" -m sglang.launch_server \
-  --model-path "${NVME_ROOT}/omnisre-v1.0" \
-  --served-model-name omnisre-27b-v1 \
+  --model-path "${OMNISRE_MODEL_DIR}" \
+  --served-model-name "${OMNISRE_SERVED_NAME}" \
   --trust-remote-code --tp-size 2 --kv-cache-dtype fp8_e4m3 --mem-fraction-static 0.80 \
   --attention-backend flashinfer --chunked-prefill-size 16384 \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder \
@@ -133,7 +138,7 @@ sudo chmod -R a+rX "${OPENRCA_DIR}/dataset"
 docker build -t openrca-executor:local "${OPENRCA_DIR}/rca/baseline/rca_agent/sandbox"
 
 cat <<EOF >"${OPENRCA_DIR}/config_omnisre.json"
-{"gemini3pro": {"model": "omnisre-27b-v1", "api_key": "sglang", "base_url": "http://127.0.0.1:30000/v1", "temperature": 0.0}}
+{"gemini3pro": {"model": "${OMNISRE_SERVED_NAME}", "api_key": "sglang", "base_url": "http://127.0.0.1:30000/v1", "temperature": 0.0}}
 EOF
 cat <<EOF >"${OPENRCA_DIR}/config_base.json"
 {"gemini3pro": {"model": "qwen38-27b-base", "api_key": "sglang", "base_url": "http://127.0.0.1:30001/v1", "temperature": 0.0}}
@@ -149,13 +154,15 @@ for DS in "Telecom" "Bank" "Market/cloudbed-1"; do
 done
 echo "[openrca] Available datasets with query.csv + telemetry: ${AVAILABLE_OPENRCA_DS[*]:-NONE}"
 
-# Parallel 6-worker-per-model dispatcher (reuses any already-scored rows on disk!)
-OPENRCA_TASKS_PER_DS="${OPENRCA_TASKS_PER_DS}" "${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
+# Parallel worker-per-model dispatcher (reuses any already-scored rows on disk!)
+OMNISRE_TAG="${OMNISRE_TAG}" OPENRCA_WORKERS="${OPENRCA_WORKERS}" OPENRCA_TASKS_PER_DS="${OPENRCA_TASKS_PER_DS}" "${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
 import concurrent.futures, glob, os, subprocess, pandas as pd
 
 openrca_dir = "/mnt/nvme/ext_bench/OpenRCA"
 py_bin = "/mnt/nvme/venv-openrca/bin/python"
 n_tasks = int(os.environ.get("OPENRCA_TASKS_PER_DS", "15"))
+n_workers = int(os.environ.get("OPENRCA_WORKERS", "4"))
+omni_tag = os.environ.get("OMNISRE_TAG", "omnisre_v1")
 datasets = [
     ds for ds in ("Telecom", "Bank", "Market/cloudbed-1")
     if os.path.exists(f"{openrca_dir}/dataset/{ds}/query.csv")
@@ -185,19 +192,19 @@ def run_one(model_tag: str, cfg_path: str, ds: str, idx: int) -> str:
                 "--start_idx", str(idx),
                 "--end_idx", str(idx),
                 "--controller_max_step", "20",
-                "--timeout", "360",
+                "--timeout", "540",
                 "--tag", tag,
             ],
             cwd=openrca_dir,
             env=env,
             stdout=lf,
             stderr=subprocess.STDOUT,
-            timeout=450,
+            timeout=720,
             check=False,
         )
     return f"{model_tag}:{ds}:{idx}"
 
-def run_model_pool(model_tag: str, cfg_path: str, workers: int = 6) -> None:
+def run_model_pool(model_tag: str, cfg_path: str, workers: int = 4) -> None:
     jobs = []
     for ds in datasets:
         done = completed_rows(ds, model_tag)
@@ -214,24 +221,25 @@ def run_model_pool(model_tag: str, cfg_path: str, workers: int = 6) -> None:
                 print(f"[openrca-pool] job error: {exc}", flush=True)
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as top:
-    f1 = top.submit(run_model_pool, "omnisre_v1", f"{openrca_dir}/config_omnisre.json", 6)
-    f2 = top.submit(run_model_pool, "base_qwen38", f"{openrca_dir}/config_base.json", 6)
+    f1 = top.submit(run_model_pool, omni_tag, f"{openrca_dir}/config_omnisre.json", n_workers)
+    f2 = top.submit(run_model_pool, "base_qwen38", f"{openrca_dir}/config_base.json", n_workers)
     f1.result()
     f2.result()
 PY
 
 # Deduplicate & summarize all OpenRCA per-row + batch CSVs into clean JSON
-"${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
+OMNISRE_TAG="${OMNISRE_TAG}" "${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
 import glob, json, os, pandas as pd
 root = "/mnt/nvme/ext_bench/OpenRCA/test/result"
 n_tasks = int(os.environ.get("OPENRCA_TASKS_PER_DS", "15"))
-summary = {"omnisre_v1": {}, "base_qwen38": {}}
+omni_tag = os.environ.get("OMNISRE_TAG", "omnisre_v1")
+summary = {omni_tag: {}, "base_qwen38": {}}
 
 for ds in ("Telecom", "Bank", "Market/cloudbed-1"):
     ds_dir = os.path.join(root, ds)
     if not os.path.isdir(ds_dir):
         continue
-    for key in ("omnisre_v1", "base_qwen38"):
+    for key in (omni_tag, "base_qwen38"):
         frames = []
         for p in sorted(glob.glob(f"{ds_dir}/agent-{key}*.csv")):
             try:
@@ -259,7 +267,7 @@ for ds in ("Telecom", "Bank", "Market/cloudbed-1"):
             "sandbox_crash_rate": round(float(crashes.mean()), 4) if len(merged) else 0.0,
         }
 
-for key in ("omnisre_v1", "base_qwen38"):
+for key in (omni_tag, "base_qwen38"):
     vals = list(summary[key].values())
     tot = sum(v["tasks"] for v in vals)
     if tot > 0:
@@ -294,12 +302,12 @@ export JUDGE_API_KEY="sglang"
 export OPENAI_API_KEY="sglang"
 export AGENT_API_KEY="sglang"
 
-echo "[sregym] Running Live SREGym-Lite (17 K8s problems) for OmniSRE v1.0..."
+echo "[sregym] Running Live SREGym-Lite (17 K8s problems) for ${OMNISRE_SERVED_NAME}..."
 AGENT_API_BASE="http://${DOCKER_GW_IP}:30000/v1" \
   uv run python main.py \
   --suite sregym-lite \
   --agent stratus \
-  --model openai/omnisre-27b-v1 \
+  --model "openai/${OMNISRE_SERVED_NAME}" \
   --judge-model openai/qwen38-27b-base \
   --internet-access open \
   --agent-timeout "${SREGYM_TIMEOUT_S}" \
@@ -319,27 +327,52 @@ AGENT_API_BASE="http://${DOCKER_GW_IP}:30001/v1" \
   > "${NVME_ROOT}/ext_results/sregym_base.log" 2>&1 || echo "[sregym] WARN: Base SREGym exited non-zero"
 cp -r "${SREGYM_DIR}/results" "${NVME_ROOT}/ext_results/sregym_runs_all" 2>/dev/null || true
 
-# Summarize SREGym CSVs + combine with OpenRCA into final_external_benchmarks.json
+# Summarize SREGym CSVs (including nested results/<run_ts>/stratus/<problem>/*_stratus_results.csv)
 "${NVME_ROOT}/venv-openrca/bin/python" - <<'PY'
 import glob, json, os, pandas as pd
 
 openrca_p = "/mnt/nvme/ext_results/openrca_summary.json"
 openrca = json.load(open(openrca_p)) if os.path.exists(openrca_p) else {}
 
-sregym_csvs = sorted(glob.glob("/mnt/nvme/ext_bench/SREGym/results/*/*_stratus_results.csv"))
+sregym_root = "/mnt/nvme/ext_bench/SREGym/results"
+run_dirs = sorted(
+    d for d in glob.glob(f"{sregym_root}/*")
+    if os.path.isdir(d) and not os.path.basename(d).startswith(".")
+)
 sregym_runs = []
-for p in sregym_csvs:
-    df = pd.read_csv(p)
+for rdir in run_dirs:
+    csv_candidates = sorted(
+        glob.glob(f"{rdir}/*_stratus_results.csv")
+        + glob.glob(f"{rdir}/*/*/*_stratus_results.csv")
+    )
+    if not csv_candidates:
+        continue
+    frames = []
+    for p in csv_candidates:
+        try:
+            frames.append(pd.read_csv(p))
+        except Exception:
+            pass
+    if not frames:
+        continue
+    df = pd.concat(frames, ignore_index=True)
+    if "problem_id" in df.columns:
+        df = df.dropna(subset=["problem_id"]).drop_duplicates(subset=["problem_id"], keep="last")
     cols = list(df.columns)
-    diag_col = next((c for c in cols if "diagnosis" in c and ("success" in c or c == "diagnosis")), None)
-    mit_col = next((c for c in cols if "mitigation" in c and ("success" in c or c == "mitigation")), None)
+    diag_col = next((c for c in cols if c == "Diagnosis.success" or ("diagnosis" in c.lower() and "success" in c.lower())), None)
+    comp_col = next((c for c in cols if c == "Diagnosis.composite_score" or "composite_score" in c.lower()), None)
+    mit_col = next((c for c in cols if c == "Mitigation.success" or ("mitigation" in c.lower() and "success" in c.lower())), None)
+    status_col = "run_status" if "run_status" in cols else None
+    truthy = [True, "True", "true", 1, "1", "pass", "passed"]
     sregym_runs.append({
-        "csv": os.path.relpath(p, "/mnt/nvme/ext_bench/SREGym/results"),
+        "run_dir": os.path.relpath(rdir, sregym_root),
         "problems": int(len(df)),
+        "completed_rate": round(float((df[status_col].astype(str).str.lower() == "complete").mean()), 4) if status_col and len(df) else None,
+        "diagnosis_pass_rate": round(float(df[diag_col].isin(truthy).mean()), 4) if diag_col and len(df) else None,
+        "diagnosis_composite_mean": round(float(pd.to_numeric(df[comp_col], errors="coerce").fillna(0.0).mean()), 4) if comp_col and len(df) else None,
+        "mitigation_pass_rate": round(float(df[mit_col].isin(truthy).mean()), 4) if mit_col and len(df) else None,
         "columns": cols,
         "rows": df.to_dict(orient="records"),
-        "diagnosis_pass_rate": round(float(df[diag_col].isin([True, "True", 1, "1", "pass", "passed"]).mean()), 4) if diag_col and len(df) else None,
-        "mitigation_pass_rate": round(float(df[mit_col].isin([True, "True", 1, "1", "pass", "passed"]).mean()), 4) if mit_col and len(df) else None,
     })
 
 final_report = {

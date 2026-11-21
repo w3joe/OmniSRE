@@ -21,7 +21,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from sre_rl.env.real_telemetry_env import RealIncidentRecord
+from sre_rl.env.real_telemetry_env import (
+    RealIncidentRecord,
+    _canonicalize_fault_set,
+    _normalize_service_token,
+)
+from sre_rl.env.v2_raw_exploration_env import StrictRawRCABreakdown, _parse_timestamp_to_unix
+from sre_rl.model.thinking import parse_qwen38_assistant_turn_multi
 from sre_rl.rewards.dapo_gtpo import DAPOConfig, RolloutGroupItem, compute_gtpo_hybrid_advantages
 
 SPECIALIST_LEAF_ROLES: tuple[tuple[str, str], ...] = (
@@ -68,6 +74,9 @@ class LeafInvestigationArtifact:
     compacted_notes_json: str
     final_submission: dict[str, object] | None
     key_observations: list[str]
+    window_start: int = 0
+    window_end: int = 0
+    alias_to_canon: dict[str, str] | None = None
 
 
 def build_segmented_rollout_items(
@@ -162,3 +171,98 @@ def build_v2_role_diverse_synthesis_prompt(
         {"role": "system", "content": sys_prompt},
         {"role": "user", "content": user_prompt},
     ]
+
+
+def score_v2_counterfactual_synthesis_turn(
+    raw_assistant_turn: str,
+    record: RealIncidentRecord,
+    leaves: list[LeafInvestigationArtifact],
+) -> StrictRawRCABreakdown:
+    """Grade a single-turn `5x` counterfactual tree synthesis response with strict 4-way verification."""
+    parsed = parse_qwen38_assistant_turn_multi(raw_assistant_turn, max_parallel_calls=2)
+    submit_args: dict[str, object] | None = None
+    if parsed.parse_error is None and parsed.tool_calls:
+        for call in parsed.tool_calls:
+            if call.name.strip().lower() == "submit_rca_report":
+                submit_args = dict(call.arguments)
+                break
+
+    if submit_args is None:
+        return StrictRawRCABreakdown(
+            total=-0.30,
+            service_score=0.0,
+            fault_score=0.0,
+            onset_time_score=0.0,
+            citation_score=0.0,
+            efficiency_penalty=0.30,
+            strict_solved=False,
+            service_exact=False,
+            fault_exact=False,
+            onset_within_90s=False,
+            citation_verified=False,
+        )
+
+    merged_alias: dict[str, str] = {}
+    corpus_chunks: list[str] = []
+    for lf in leaves:
+        if lf.alias_to_canon:
+            for k, v in lf.alias_to_canon.items():
+                merged_alias[k.lower()] = v
+        if lf.compacted_notes_json:
+            corpus_chunks.append(lf.compacted_notes_json)
+        corpus_chunks.extend(lf.key_observations)
+
+    raw_pred_svc = str(submit_args.get("root_service", "")).strip()
+    unaliased_svc = merged_alias.get(raw_pred_svc.lower(), raw_pred_svc)
+    pred_svc_norm = _normalize_service_token(unaliased_svc)
+    gt_svc_norm = _normalize_service_token(record.ground_truth_service)
+
+    svc_exact = bool(pred_svc_norm and pred_svc_norm == gt_svc_norm)
+    svc_partial = bool(
+        pred_svc_norm
+        and not svc_exact
+        and (gt_svc_norm in pred_svc_norm or pred_svc_norm in gt_svc_norm)
+    )
+    service_score = 0.40 if svc_exact else (0.25 if svc_partial else 0.0)
+
+    pred_fault_set = _canonicalize_fault_set(str(submit_args.get("fault_type", "")))
+    gt_fault_set = _canonicalize_fault_set(record.ground_truth_fault)
+    fault_exact = bool(pred_fault_set & gt_fault_set)
+    fault_score = 0.25 if fault_exact else 0.0
+
+    pred_ts = _parse_timestamp_to_unix(submit_args.get("onset_timestamp"))
+    onset_within_90s = False
+    onset_score = 0.0
+    if pred_ts is not None:
+        delta_s = abs(pred_ts - record.inject_timestamp)
+        if delta_s <= 90:
+            onset_within_90s = True
+            onset_score = 0.20
+        elif delta_s <= 240:
+            onset_score = 0.10
+
+    citation = str(submit_args.get("cited_evidence", "")).strip()
+    full_obs_blob = "\n".join(corpus_chunks)
+    citation_verified = False
+    citation_score = 0.0
+    if len(citation) >= 6 and citation in full_obs_blob:
+        citation_verified = True
+        citation_score = 0.15 if (svc_exact or svc_partial) else 0.03
+    elif citation:
+        citation_score = -0.08
+
+    total = round(max(-0.50, service_score + fault_score + onset_score + citation_score), 4)
+    strict_solved = (svc_exact or svc_partial) and fault_exact and onset_within_90s
+    return StrictRawRCABreakdown(
+        total=total,
+        service_score=service_score,
+        fault_score=fault_score,
+        onset_time_score=onset_score,
+        citation_score=citation_score,
+        efficiency_penalty=0.0,
+        strict_solved=strict_solved,
+        service_exact=svc_exact or svc_partial,
+        fault_exact=fault_exact,
+        onset_within_90s=onset_within_90s,
+        citation_verified=citation_verified,
+    )

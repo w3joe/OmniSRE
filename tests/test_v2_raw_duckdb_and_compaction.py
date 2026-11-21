@@ -12,6 +12,7 @@ from sre_rl.v2_tree_and_compaction import (
     build_segmented_rollout_items,
     build_v2_role_diverse_synthesis_prompt,
     is_disagreeing_counterfactual_leaf_set,
+    score_v2_counterfactual_synthesis_turn,
 )
 
 
@@ -173,3 +174,108 @@ def test_segmented_100_turn_gtpo_and_disagreeing_5x_synthesis(tmp_path: Path) ->
     assert "log_forensics_specialist" in msgs[1]["content"]
     assert "trace_dag_specialist" in msgs[1]["content"]
     assert json.loads("{}") == {}
+
+
+def test_v2_counterfactual_synthesis_scoring_with_aliasing_and_citation_verification(
+    tmp_path: Path,
+) -> None:
+    rec = _write_sample_incident(tmp_path)
+    alias_map = {"svc-prod-412": "paymentservice", "svc-prod-108": "frontend"}
+    leaves = [
+        LeafInvestigationArtifact(
+            role_name="metrics_inflection_specialist",
+            strict_solved=False,
+            outcome_reward=0.10,
+            compacted_notes_json='{"confirmed_anomalies": ["svc-prod-108 latency spike at 10012"]}',
+            final_submission={"root_service": "svc-prod-108", "fault_type": "delay", "onset_timestamp": 10012},
+            key_observations=["[10012] [svc-prod-108] ERROR: Upstream RPC timeout calling svc-prod-412:50051"],
+            window_start=9400,
+            window_end=10600,
+            alias_to_canon=alias_map,
+        ),
+        LeafInvestigationArtifact(
+            role_name="log_forensics_specialist",
+            strict_solved=True,
+            outcome_reward=1.0,
+            compacted_notes_json='{"confirmed_anomalies": ["svc-prod-412 NullPointerException at 10005"]}',
+            final_submission={"root_service": "svc-prod-412", "fault_type": "code_fault", "onset_timestamp": 10005},
+            key_observations=[
+                "[10005] [svc-prod-412] ERROR: NullPointerException in ChargeProcessor.execute(ChargeProcessor.java:142)"
+            ],
+            window_start=9400,
+            window_end=10600,
+            alias_to_canon=alias_map,
+        ),
+    ]
+
+    # 1. Valid counterfactual synthesis isolating aliased leaf root cause + verbatim citation -> 1.0
+    good_turn = (
+        "<think>svc-prod-108 timeout at 10012 is downstream of svc-prod-412 NPE at 10005.</think>\n"
+        '<tool_call>{"name": "submit_rca_report", "arguments": {'
+        '"root_service": "svc-prod-412", '
+        '"fault_type": "code_fault", '
+        '"onset_timestamp": 10005, '
+        '"cited_evidence": "NullPointerException in ChargeProcessor.execute", '
+        '"causal_chain": "svc-prod-412 threw NPE at 10005 causing svc-prod-108 RPC timeouts"'
+        "}}</tool_call>"
+    )
+    sc_good = score_v2_counterfactual_synthesis_turn(good_turn, rec, leaves)
+    assert sc_good.strict_solved is True
+    assert sc_good.service_exact is True
+    assert sc_good.fault_exact is True
+    assert sc_good.onset_within_90s is True
+    assert sc_good.citation_verified is True
+    assert sc_good.total == 1.0
+
+    # 2. Wrong fault mechanism (`cpu` instead of `code_fault`) + fabricated citation -> rejected
+    bad_turn = (
+        '<tool_call>{"name": "submit_rca_report", "arguments": {'
+        '"root_service": "svc-prod-412", '
+        '"fault_type": "cpu", '
+        '"onset_timestamp": 10005, '
+        '"cited_evidence": "NON_EXISTENT_HALLUCINATION_STRING"'
+        "}}</tool_call>"
+    )
+    sc_bad = score_v2_counterfactual_synthesis_turn(bad_turn, rec, leaves)
+    assert sc_bad.strict_solved is False
+    assert sc_bad.fault_exact is False
+    assert sc_bad.citation_verified is False
+    assert sc_bad.citation_score < 0.0
+
+    # 3. Malformed / missing tool call -> -0.30 penalty
+    sc_missing = score_v2_counterfactual_synthesis_turn("<think>no tool call</think>", rec, leaves)
+    assert sc_missing.strict_solved is False
+    assert sc_missing.total == -0.30
+
+
+def test_sregym_nested_cumulative_csv_parser(tmp_path: Path) -> None:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from summarize_external_benchmarks import parse_sregym_run_dir
+
+    run_dir = tmp_path / "1121_1738"
+    p1_dir = run_dir / "stratus" / "network_policy_block"
+    p2_dir = run_dir / "stratus" / "namespace_memory_limit"
+    p1_dir.mkdir(parents=True)
+    p2_dir.mkdir(parents=True)
+
+    (p1_dir / "network_policy_block_stratus_results.csv").write_text(
+        "problem_id,run_status,Diagnosis.success,Diagnosis.composite_score,Mitigation.success,timed_out\n"
+        "network_policy_block,complete,True,1.0,True,\n",
+        encoding="utf-8",
+    )
+    (p2_dir / "namespace_memory_limit_stratus_results.csv").write_text(
+        "problem_id,run_status,Diagnosis.success,Diagnosis.composite_score,Mitigation.success,timed_out\n"
+        "network_policy_block,complete,True,1.0,True,\n"
+        "namespace_memory_limit,incomplete,True,0.89,,True\n",
+        encoding="utf-8",
+    )
+
+    summary = parse_sregym_run_dir(run_dir)
+    assert summary["problems"] == 2
+    assert summary["diagnosis_pass_count"] == 2
+    assert summary["diagnosis_pass_rate"] == 1.0
+    assert summary["mitigation_pass_count"] == 1
+    assert summary["mitigation_pass_rate"] == 0.5
+    assert summary["diagnosis_composite_mean"] == 0.945
