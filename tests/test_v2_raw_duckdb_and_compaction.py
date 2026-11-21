@@ -86,12 +86,13 @@ def test_v2_duckdb_haystack_isolation_sql_speed_and_strict_grading(tmp_path: Pat
         t0 = time.perf_counter()
         step_out = env.step(
             "<think>Run analytical SQL, trace call graph & grep logs in parallel</think>\n"
+            '<tool_call>{"name": "sql_telemetry_query", "arguments": {"sql": "SELECT service, metric, MAX(value) AS mx FROM metrics GROUP BY 1, 2 ORDER BY mx DESC LIMIT 5"}}</tool_call>\n'
             '<tool_call>{"name": "trace_call_graph", "arguments": {}}</tool_call>\n'
             '<tool_call>{"name": "grep_logs", "arguments": {"regex": "NullPointerException"}}</tool_call>'
         )
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         assert elapsed_ms < 150.0
-        assert "NullPointerException in ChargeProcessor.execute" in step_out.observation
+        assert "columns" in step_out.observation and "NullPointerException in ChargeProcessor.execute" in step_out.observation
         # Trace self-latency isolates aliased paymentservice (~945ms self_p95_ms) over frontend (~15ms self_p95_ms)!
         aliased_payment = env._canon_to_alias["paymentservice"]
         assert aliased_payment in step_out.observation

@@ -440,7 +440,7 @@ class RawDuckDBExplorationEnv:
 
     def render_initial_alert(self) -> str:
         assert self._record is not None
-        n_svcs = self._con.execute("SELECT COUNT(DISTINCT service) FROM metrics").fetchone()[0] if self._con else 0
+        n_svcs = self._con.execute("SELECT COUNT(DISTINCT service) FROM metrics").fetchall()[0][0] if self._con else 0
         ws_blk = self._workspace.render_prompt_block()
         return (
             f"[ENTERPRISE PAGER ALERT] Incident ID: {self._record.case_id}\n"
@@ -621,7 +621,7 @@ class RawDuckDBExplorationEnv:
             self._read_queries += 1
             stats = {}
             for tbl in ("metrics", "logs", "traces"):
-                cnt, t0, t1 = self._con.execute(f"SELECT COUNT(*), MIN(ts), MAX(ts) FROM {tbl}").fetchone()
+                cnt, t0, t1 = self._con.execute(f"SELECT COUNT(*), MIN(ts), MAX(ts) FROM {tbl}").fetchall()[0]
                 cols = [r[0] for r in self._con.execute(f"DESCRIBE {tbl}").fetchall()]
                 stats[tbl] = {"rows": cnt, "min_ts": t0, "max_ts": t1, "columns": cols}
             return json.dumps(stats, indent=2), False, False, 0.015
@@ -631,14 +631,17 @@ class RawDuckDBExplorationEnv:
             if not sql or FORBIDDEN_SQL_RE.search(sql) or not sql.lower().lstrip().startswith(("select", "with", "describe", "show")):
                 return "SQL_REJECTED: Only read-only `SELECT` / `WITH` queries over `metrics`, `logs`, `traces` are permitted.", False, False, -0.04
             self._read_queries += 1
+            cur = self._con.cursor()
             try:
-                rel = self._con.sql(sql)
-                cols = rel.columns
-                rows = rel.fetchmany(50)
+                cur.execute(sql)
+                cols = [d[0] for d in (cur.description or [])]
+                rows = cur.fetchmany(50)
                 formatted = [dict(zip(cols, [round(v, 4) if isinstance(v, float) else v for v in r], strict=True)) for r in rows]
                 return json.dumps({"columns": cols, "rows": formatted, "truncated_at": 50}, default=str), False, False, 0.025
-            except duckdb.Error as exc:
+            except (duckdb.Error, ValueError, RuntimeError) as exc:
                 return f"SQL_ERROR: {exc}", False, False, -0.01
+            finally:
+                cur.close()
 
         if name == "promql_range_query":
             self._read_queries += 1
