@@ -681,6 +681,19 @@ def main() -> None:
                         subprocess.run(["gcloud", "storage", "rsync", "-r", str(bdir), f"{args.gcs_backup_prefix.rstrip('/')}/best_checkpoint", "--quiet"], check=False)
         dist.barrier()
 
+    if local_rank == 0:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        peft_model.save_pretrained(args.output_dir)
+        tokenizer.save_pretrained(args.output_dir)
+        after_eval = _eval_raw_unseen("after_rl_v2_final")
+        summary = {
+            "before_rl": before_eval,
+            "after_rl": after_eval,
+            "best_strict_solved": best_strict,
+            "total_rollouts_generated": total_rollouts_generated,
+        }
+        (args.output_dir / "v2_eval_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    dist.barrier()
     dist.destroy_process_group()
 
 
