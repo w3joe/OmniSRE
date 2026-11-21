@@ -614,17 +614,18 @@ def main() -> None:
     parser.add_argument("--tier1-heldout-json", type=Path, default=Path("/mnt/nvme/data_v2/rl_real_heldout.jsonl"))
     parser.add_argument("--kind-lease-dir", type=Path, default=Path("/mnt/nvme/kind-leases"))
     parser.add_argument("--steps", type=int, default=250)
+    parser.add_argument("--start-step", type=int, default=1, help="Resume step index when starting from a merged checkpoint")
     parser.add_argument("--prompts-per-step", type=int, default=8)
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("--rollout-workers", type=int, default=24)
     parser.add_argument("--eval-heldout-count", type=int, default=40)
     parser.add_argument("--max-turns", type=int, default=24)
     parser.add_argument("--harness-rand-prob", type=float, default=0.60)
-    parser.add_argument("--max-train-seq-len", type=int, default=6656)
+    parser.add_argument("--max-train-seq-len", type=int, default=5632)
     parser.add_argument("--lr", type=float, default=3e-6)
     parser.add_argument("--sync-every", type=int, default=2)
     parser.add_argument("--eval-every", type=int, default=25)
-    parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument("--save-every", type=int, default=15)
     parser.add_argument("--gcs-backup-prefix", type=str, default="")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -764,11 +765,12 @@ def main() -> None:
         print(f"[v1-heldout-eval] {json.dumps(summary)}", flush=True)
         return summary
 
-    before_eval = _eval_all_unseen("before_rl_v1_omnisre")
+    before_label = "before_rl_v1_omnisre" if args.start_step <= 1 else f"resume_step_{args.start_step - 1:03d}"
+    before_eval = _eval_all_unseen(before_label)
     dist.barrier()
     best_solved = float(before_eval.get("solved_rate", 0.0)) if local_rank == 0 else 0.0
 
-    for step in range(1, args.steps + 1):
+    for step in range(max(1, args.start_step), args.steps + 1):
         t0 = time.time()
         payload_for_ranks: list[tuple[list[int], np.ndarray, np.ndarray]] = []
         step_metrics: dict[str, Any] = {}

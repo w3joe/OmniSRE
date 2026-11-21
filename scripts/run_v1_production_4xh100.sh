@@ -12,6 +12,7 @@ GCS_BUCKET="${GCS_BUCKET:-gs://onflow-30k-qwen38-sre-rl}"
 GCS_V1="${GCS_V1:-${GCS_BUCKET}/omnisre-v1.0}"
 BASE_MODEL="${BASE_MODEL:-${NVME_ROOT}/checkpoints_v6/omnisre-v5-merged}"
 STEPS="${STEPS:-250}"
+START_STEP="${START_STEP:-1}"
 MAX_TURNS="${MAX_TURNS:-24}"
 ENABLE_OPENRCA="${ENABLE_OPENRCA:-0}"
 ENABLE_LIVE_KIND="${ENABLE_LIVE_KIND:-1}"
@@ -108,16 +109,18 @@ CUDA_VISIBLE_DEVICES=2,3 /mnt/nvme/venv-sre-rl/bin/torchrun --nproc_per_node=2 -
   --tier1-heldout-json "${NVME_ROOT}/data_v2/rl_real_heldout.jsonl" \
   --kind-lease-dir "${NVME_ROOT}/kind-leases" \
   --steps "${STEPS}" \
+  --start-step "${START_STEP}" \
   --prompts-per-step 8 \
   --group-size 8 \
   --rollout-workers 24 \
   --eval-heldout-count 40 \
   --max-turns "${MAX_TURNS}" \
   --harness-rand-prob 0.60 \
+  --max-train-seq-len 5632 \
   --lr 3e-6 \
   --sync-every 2 \
   --eval-every 25 \
-  --save-every 25 \
+  --save-every 15 \
   --gcs-backup-prefix "${GCS_V1}"
 
 gcloud storage rsync -r "${NVME_ROOT}/checkpoints_v1/omnisre-27b-v1.0" "${GCS_V1}/final" --quiet

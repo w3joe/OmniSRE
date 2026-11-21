@@ -140,7 +140,7 @@ class RealTelemetryHarnessConfig:
         rem_toks = max(0, self.max_context_tokens - used_tokens)
         sub_name = self.tool_name("submit_rca_report")
         footer = f"\n[budget: turns_remaining={rem_turns}/{self.max_turns} | tokens_remaining={rem_toks}]"
-        if rem_turns <= 2:
+        if rem_turns <= 2 or rem_toks <= 2500:
             footer += f"\n[WARNING: Budget nearly exhausted — call `{sub_name}` now.]"
         return footer
 
@@ -743,11 +743,12 @@ class RealTelemetryReplayEnvironment:
                 svc = str(row.get("container_name") or row.get("service") or "")
                 msg = str(row.get("message") or "")
                 lvl = str(row.get("level") or "")
-                err_col = str(row.get("error") or "")
+                err_col = str(row.get("error") or "").strip()
+                has_err_col = err_col.lower() not in ("", "0", "0.0", "false", "none", "null", "ok")
 
                 if service and service not in svc.lower():
                     continue
-                if errors_only and not (err_col or err_re.search(f"{lvl} {msg}")):
+                if errors_only and not (has_err_col or err_re.search(f"{lvl} {msg}")):
                     continue
                 if regex and not regex.search(msg):
                     continue
