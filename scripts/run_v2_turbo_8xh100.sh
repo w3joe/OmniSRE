@@ -94,7 +94,7 @@ CUDA_VISIBLE_DEVICES="${TRAINER_GPUS}" "${NVME_ROOT}/venv-sre-rl/bin/torchrun" -
   --rollout-workers "${WORKERS}" \
   --max-turns "${MAX_TURNS}" \
   --distractors 40 \
-  --max-train-seq-len 5632 \
+  --max-train-seq-len 4864 \
   --lr 3e-6 \
   --min-lr 3e-7 \
   --sync-every 2 \
