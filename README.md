@@ -47,8 +47,6 @@ Evaluated in official third-party Dockerized Python sandboxes (`microsoft/OpenRC
 | **Live `SREGym-Lite`** *(17 Kind K8s faults)* | Diagnosis Pass / Composite | `17.6%` (`0.255`) | **`23.5%` (`0.301`)** | **`+5.9 pp` (`+33%` rel.)** |
 | **Live `SREGym-Lite`** *(17 Kind K8s faults)* | Live Cluster Mitigation Rate | `11.8%` (`2/17`) | **`17.6%` (`3/17`)** | **`+5.9 pp` (`1.5×`)** |
 | **Live `SREGym-Lite`** *(17 Kind K8s faults)* | End-to-End Run Completion | `41.2%` (`7/17`) | **`47.1%` (`8/17`)** | **`+5.9 pp`** |
-| **Live K8s `SREGym-Lite`** *(17 live 4-node Kind faults, 8m cap)* | Live Cluster Mitigation / Diagnosis | `11.8%` / `17.6%` | **`17.6%` / `23.5%`** | **`1.5×` mit. / `+5.9 pp` diag.** |
-| **`microsoft/OpenRCA` (`Telecom`)** *(Docker Pandas sandbox)* | Strict 3-Way Acc / Crash Rate | `0.0%` / `37.5%` (`44m`/task) | **`6.7%` / `13.3%` (`14m`/task)** | **`3.1×` faster · `2.8×` fewer crashes** |
 
 ---
 

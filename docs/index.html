@@ -751,56 +751,6 @@
         </table>
       </div>
 
-      <h3>Table 3 — Official Third-Party External Benchmarks (<code>microsoft/OpenRCA</code> &amp; Live 4-Node Kind <code>SREGym-Lite</code>)</h3>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>External Benchmark</th>
-              <th>Model</th>
-              <th class="num">Tasks</th>
-              <th class="num">Primary Pass / Strict Acc.</th>
-              <th class="num">Secondary / Mitigation</th>
-              <th class="num">Crash / Timeout Rate</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td><code>microsoft/OpenRCA</code> (Telecom Sandbox)</td>
-              <td><code>Qwen/Qwen3.8-27B</code> (Base)</td>
-              <td class="num">8</td>
-              <td class="num">0.0%</td>
-              <td class="num">14.6% partial</td>
-              <td class="num">37.5% crash</td>
-            </tr>
-            <tr class="highlight">
-              <td><strong><code>microsoft/OpenRCA</code> (Telecom Sandbox)</strong></td>
-              <td><strong><code>OmniSRE-27B v1.0</code> (Ours)</strong></td>
-              <td class="num">15</td>
-              <td class="num"><span class="gain">6.7% (+6.7 pp)</span></td>
-              <td class="num">14.4% partial</td>
-              <td class="num"><span class="gain">13.3% crash (&minus;24.2 pp)</span></td>
-            </tr>
-            <tr>
-              <td>Live <code>SREGym-Lite</code> (4-Node Kind K8s)</td>
-              <td><code>Qwen/Qwen3.8-27B</code> (Base)</td>
-              <td class="num">17</td>
-              <td class="num">17.6% diag (0.255 comp)</td>
-              <td class="num">11.8% mitigated (2/17)</td>
-              <td class="num">58.8% timeout</td>
-            </tr>
-            <tr class="highlight">
-              <td><strong>Live <code>SREGym-Lite</code> (4-Node Kind K8s)</strong></td>
-              <td><strong><code>OmniSRE-27B v1.0</code> (Ours)</strong></td>
-              <td class="num">17</td>
-              <td class="num"><span class="gain">23.5% diag (0.301 comp)</span></td>
-              <td class="num"><span class="gain">17.6% mitigated (3/17)</span></td>
-              <td class="num"><span class="gain">52.9% timeout (&minus;5.9 pp)</span></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-
       <h3>Table 3 — Official Third-Party External Benchmarks (Live 4-Node Kind <code>SREGym-Lite</code> &amp; <code>microsoft/OpenRCA</code>)</h3>
       <div class="table-wrap">
         <table>
@@ -811,6 +761,7 @@
               <th>Model</th>
               <th class="num">Primary Pass Rate</th>
               <th class="num">Secondary Metric</th>
+              <th class="num">Crash / Speed</th>
             </tr>
           </thead>
           <tbody>
@@ -819,28 +770,32 @@
               <td>4-node Kind + Calico + Prometheus/Jaeger/Loki</td>
               <td><code>Qwen/Qwen3.8-27B</code> (Base + Stratus)</td>
               <td class="num">11.8% Mitigated (2/17)</td>
-              <td class="num">17.6% Diagnosed · 5.9% Full E2E</td>
+              <td class="num">17.6% Diagnosed (0.255 comp)</td>
+              <td class="num">41.2% Completed</td>
             </tr>
             <tr class="highlight">
               <td><strong><code>SREGym-Lite</code> (17 Live K8s Faults, 480s cap)</strong></td>
               <td>4-node Kind + Calico + Prometheus/Jaeger/Loki</td>
               <td><strong><code>OmniSRE-27B v1.0</code> (Ours + Stratus)</strong></td>
               <td class="num"><span class="gain">17.6% Mitigated (1.5&times;)</span></td>
-              <td class="num"><span class="gain">23.5% Diagnosed · 11.8% Full E2E (2.0&times;)</span></td>
+              <td class="num"><span class="gain">23.5% Diagnosed (0.301 comp)</span></td>
+              <td class="num"><span class="gain">47.1% Completed</span></td>
             </tr>
             <tr>
               <td><code>microsoft/OpenRCA</code> (<code>Telecom</code>)</td>
               <td>Dockerized Python/Pandas over raw CSVs</td>
               <td><code>Qwen/Qwen3.8-27B</code> (Base + RCA-Agent)</td>
               <td class="num">0.0% Strict (0/8)</td>
-              <td class="num">37.5% Sandbox Crashes · ~44m/task</td>
+              <td class="num">14.6% Partial</td>
+              <td class="num">37.5% Crashes · ~44m/task</td>
             </tr>
             <tr class="highlight">
               <td><strong><code>microsoft/OpenRCA</code> (<code>Telecom</code>)</strong></td>
               <td>Dockerized Python/Pandas over raw CSVs</td>
               <td><strong><code>OmniSRE-27B v1.0</code> (Ours + RCA-Agent)</strong></td>
               <td class="num"><span class="gain">6.7% Strict (1/15)</span></td>
-              <td class="num"><span class="gain">13.3% Sandbox Crashes · ~14m/task (3.1&times; faster)</span></td>
+              <td class="num">14.4% Partial</td>
+              <td class="num"><span class="gain">13.3% Crashes · ~14m/task (3.1&times; faster)</span></td>
             </tr>
           </tbody>
         </table>
