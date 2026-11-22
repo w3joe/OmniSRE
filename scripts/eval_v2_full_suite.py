@@ -149,33 +149,71 @@ def main() -> None:
         random.Random(42).shuffle(bucket)
         tree_slice.extend(bucket[:per_ds])
 
-    print(f"[v2-bench] Evaluating {len(heldout_records)} unseen raw incidents (1x Greedy)...", flush=True)
-    v2_raw_1x = eval_v2_raw_1x(v2_urls, tokenizer, heldout_records, args.max_turns, 4864, args.distractors, args.workers)
+    print(f"[v2-bench] Evaluating {len(heldout_records)} unseen raw incidents (1x Greedy, parallel v2 vs v1)...", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as top_pool:
+        fut_v2_1x = top_pool.submit(
+            eval_v2_raw_1x, v2_urls, tokenizer, heldout_records, args.max_turns, 4864, args.distractors, args.workers
+        )
+        fut_base_1x = (
+            top_pool.submit(
+                eval_v2_raw_1x, base_urls, tokenizer, heldout_records, args.max_turns, 4864, args.distractors, args.workers
+            )
+            if base_urls
+            else None
+        )
+        v2_raw_1x = fut_v2_1x.result()
+        base_raw_1x = fut_base_1x.result() if fut_base_1x else None
     print("[v2-bench] OmniSRE v2.0 Raw 1x:", json.dumps(v2_raw_1x), flush=True)
+    if base_raw_1x:
+        print("[v2-bench] Baseline (v1.0) Raw 1x:", json.dumps(base_raw_1x), flush=True)
 
-    base_raw_1x = None
-    if base_urls:
-        base_raw_1x = eval_v2_raw_1x(base_urls, tokenizer, heldout_records, args.max_turns, 4864, args.distractors, args.workers)
-        print("[v2-bench] Baseline Raw 1x:", json.dumps(base_raw_1x), flush=True)
-
-    print(f"[v2-bench] Evaluating Role-Diverse 5x Specialist Tree on {len(tree_slice)} unseen incidents...", flush=True)
-    v2_tree_5x = evaluate_v2_role_diverse_tree_5x(
-        v2_urls, tokenizer, tree_slice, args.max_turns, 4864, args.distractors, args.workers
-    )
+    print(f"[v2-bench] Evaluating Role-Diverse 5x Specialist Tree on {len(tree_slice)} unseen incidents (parallel v2 vs v1)...", flush=True)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as top_pool:
+        fut_v2_5x = top_pool.submit(
+            evaluate_v2_role_diverse_tree_5x, v2_urls, tokenizer, tree_slice, args.max_turns, 4864, args.distractors, args.workers
+        )
+        fut_base_5x = (
+            top_pool.submit(
+                evaluate_v2_role_diverse_tree_5x, base_urls, tokenizer, tree_slice, args.max_turns, 4864, args.distractors, args.workers
+            )
+            if base_urls
+            else None
+        )
+        v2_tree_5x = fut_v2_5x.result()
+        base_tree_5x = fut_base_5x.result() if fut_base_5x else None
     print("[v2-bench] OmniSRE v2.0 Role-Diverse 5x Tree:", json.dumps(v2_tree_5x), flush=True)
+    if base_tree_5x:
+        print("[v2-bench] Baseline (v1.0) Role-Diverse 5x Tree:", json.dumps(base_tree_5x), flush=True)
 
     v2_tier1 = None
+    base_tier1 = None
     if args.heldout_tier1_jsonl.exists():
         print(f"[v2-bench] Evaluating {args.tier1_limit} unseen Tier-1 write-remediation topologies (k=3)...", flush=True)
-        v2_tier1 = eval_tier1_write(v2_urls[0], tokenizer, args.heldout_tier1_jsonl, args.tier1_limit, 3, min(32, args.workers))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as top_pool:
+            fut_t1_v2 = top_pool.submit(
+                eval_tier1_write, v2_urls[0], tokenizer, args.heldout_tier1_jsonl, args.tier1_limit, 3, min(32, args.workers)
+            )
+            fut_t1_base = (
+                top_pool.submit(
+                    eval_tier1_write, base_urls[0], tokenizer, args.heldout_tier1_jsonl, args.tier1_limit, 3, min(32, args.workers)
+                )
+                if base_urls
+                else None
+            )
+            v2_tier1 = fut_t1_v2.result()
+            base_tier1 = fut_t1_base.result() if fut_t1_base else None
         print("[v2-bench] OmniSRE v2.0 Tier-1 Write:", json.dumps(v2_tier1), flush=True)
+        if base_tier1:
+            print("[v2-bench] Baseline (v1.0) Tier-1 Write:", json.dumps(base_tier1), flush=True)
 
     report = {
-        "checkpoint": "OmniSRE v2.0",
+        "checkpoint": "OmniSRE v2.0 (Step 50)",
         "v2_raw_unseen_1x": v2_raw_1x,
         "baseline_raw_unseen_1x": base_raw_1x,
         "v2_role_diverse_tree_5x": v2_tree_5x,
+        "baseline_role_diverse_tree_5x": base_tree_5x,
         "v2_tier1_write_remediation": v2_tier1,
+        "baseline_tier1_write_remediation": base_tier1,
     }
     args.out_json.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"[v2-bench] Saved full v2.0 benchmark report -> {args.out_json}", flush=True)
