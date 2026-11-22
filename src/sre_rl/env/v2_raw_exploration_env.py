@@ -184,30 +184,40 @@ def _get_or_parse_v2_metrics_file(
                     fsize_mb = Path(csv_str).stat().st_size / (1024 * 1024)
                     # Uniform stride (`rowid % stride == 0`) on >60MB OpenRCA day CSVs preserves 100% of services & KPIs at 15-30s cadence
                     stride = max(1, int(fsize_mb // 40))
-                    cols_desc = [r[0] for r in tmp_con.execute("DESCRIBE SELECT * FROM read_csv_auto(?)", [csv_str]).fetchall()]
+                    try:
+                        cols_desc = [
+                            r[0] for r in tmp_con.execute("DESCRIBE SELECT * FROM read_csv_auto(?, ignore_errors=true)", [csv_str]).fetchall()
+                        ]
+                    except duckdb.Error:
+                        continue
+                    if "timestamp" not in cols_desc or "value" not in cols_desc:
+                        continue
                     svc_expr = "cmdb_id" if "cmdb_id" in cols_desc else ("service" if "service" in cols_desc else "'unknown'")
                     kpi_expr = "kpi_name" if "kpi_name" in cols_desc else ("name" if "name" in cols_desc else "'kpi'")
-                    fetched = tmp_con.execute(
-                        f"""
-                        WITH raw AS (
-                            SELECT row_number() OVER () AS rn, * FROM read_csv_auto(?, ignore_errors=true)
-                        )
-                        SELECT
-                            CASE
-                                WHEN TRY_CAST(timestamp AS DOUBLE) > 1e12 THEN CAST(TRY_CAST(timestamp AS DOUBLE) / 1000 AS BIGINT)
-                                ELSE TRY_CAST(TRY_CAST(timestamp AS DOUBLE) AS BIGINT)
-                            END AS ts,
-                            CAST({svc_expr} AS VARCHAR) AS svc,
-                            CAST({kpi_expr} AS VARCHAR) AS kpi,
-                            ROUND(TRY_CAST(value AS DOUBLE), 5) AS val
-                        FROM raw
-                        WHERE rn % {stride} = 0
-                          AND TRY_CAST(timestamp AS DOUBLE) IS NOT NULL
-                          AND TRY_CAST(value AS DOUBLE) IS NOT NULL
-                          AND NOT isnan(TRY_CAST(value AS DOUBLE))
-                        """,
-                        [csv_str],
-                    ).fetchall()
+                    try:
+                        fetched = tmp_con.execute(
+                            f"""
+                            WITH raw AS (
+                                SELECT row_number() OVER () AS rn, * FROM read_csv_auto(?, ignore_errors=true)
+                            )
+                            SELECT
+                                CASE
+                                    WHEN TRY_CAST(timestamp AS DOUBLE) > 1e12 THEN CAST(TRY_CAST(timestamp AS DOUBLE) / 1000 AS BIGINT)
+                                    ELSE TRY_CAST(TRY_CAST(timestamp AS DOUBLE) AS BIGINT)
+                                END AS ts,
+                                CAST({svc_expr} AS VARCHAR) AS svc,
+                                CAST({kpi_expr} AS VARCHAR) AS kpi,
+                                ROUND(TRY_CAST(value AS DOUBLE), 5) AS val
+                            FROM raw
+                            WHERE rn % {stride} = 0
+                              AND TRY_CAST(timestamp AS DOUBLE) IS NOT NULL
+                              AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+                              AND NOT isnan(TRY_CAST(value AS DOUBLE))
+                            """,
+                            [csv_str],
+                        ).fetchall()
+                    except duckdb.Error:
+                        continue
                     for ts, svc, m_name, val in fetched:
                         if ts is not None and val is not None:
                             s_clean = str(svc).strip()

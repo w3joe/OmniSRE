@@ -39,6 +39,11 @@ def _make_telecom_scale_mismatch_incident(tmp_path: Path) -> RealIncidentRecord:
     ]
     mpath.write_text("\n".join(m_lines), encoding="utf-8")
     lpath.write_text("\n".join(l_lines), encoding="utf-8")
+    # Also write a sibling `metric_service.csv` without a `value` column (exact OpenRCA-Market layout!)
+    (tmp_path / "metric_service.csv").write_text(
+        "timestamp,service,rr,sr,mrt,count\n20000,frontend,100,99.9,12.4,450\n",
+        encoding="utf-8",
+    )
 
     return RealIncidentRecord(
         case_id="openrca-bank-00001",
