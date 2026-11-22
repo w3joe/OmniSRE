@@ -184,10 +184,10 @@ def build_v2_role_diverse_synthesis_prompt(
     """Build a structured counterfactual synthesis prompt over role-diversified specialist leaves."""
     sections: list[str] = []
     for idx, lf in enumerate(leaves, start=1):
-        obs_preview = "\n".join(f"  [obs_{j+1}] {o[:320]}" for j, o in enumerate(lf.key_observations[-4:]))
+        obs_preview = "\n".join(f"  [obs_{j+1}] {o[:240]}" for j, o in enumerate(lf.key_observations[-3:]))
         sections.append(
             f"=== LEAF #{idx} ({lf.role_name}) ===\n"
-            f"Compacted Workspace: {lf.compacted_notes_json[:600]}\n"
+            f"Compacted Workspace: {lf.compacted_notes_json[:380]}\n"
             f"Candidate Submission: {json.dumps(lf.final_submission, default=str)}\n"
             f"Raw Tool Evidence:\n{obs_preview}"
         )
@@ -197,9 +197,9 @@ def build_v2_role_diverse_synthesis_prompt(
         "Five specialist investigators explored the same noisy production window using different angles "
         "(metrics inflection, trace self-latency DAG, log chronology, DB saturation, and red-herring falsification).\n"
         "Cross-examine their raw evidence: discard transient single-minute blips and downstream victim cascades, "
-        "identify the earliest sustained upstream/leaf root cause, and emit ONE `<tool_call>` to `submit_rca_report` "
-        "with `root_service`, `fault_type`, `onset_timestamp`, `cited_evidence` (verbatim from raw tool evidence), "
-        "and `causal_chain`."
+        "identify the earliest sustained upstream/leaf root cause, keep `<think>` concise (<= 5 sentences), "
+        "and immediately emit ONE `<tool_call>` to `submit_rca_report` with `root_service`, `fault_type`, "
+        "`onset_timestamp`, `cited_evidence` (verbatim substring from Raw Tool Evidence), and `causal_chain`."
     )
     user_prompt = (
         f"[5x COUNTERFACTUAL SYNTHESIS] Incident: {record.case_id} | "

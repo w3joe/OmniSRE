@@ -59,6 +59,12 @@ def main() -> None:
         help="Optional max optimizer steps override for smoke-testing.",
     )
     parser.add_argument(
+        "--model-path",
+        type=str,
+        default="",
+        help="Optional override for base model path (e.g., /mnt/nvme/omnisre-v1.0 for Phase-3 SFT).",
+    )
+    parser.add_argument(
         "--skip-merge",
         action="store_true",
         help="Skip merging LoRA into a 54GB BF16 checkpoint at end of run.",
@@ -68,14 +74,15 @@ def main() -> None:
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
 
     import json
+    import shutil
 
     import torch
     from datasets import Dataset
     from peft import LoraConfig, PeftModel, get_peft_model
-    from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+    from transformers import AutoModelForImageTextToText, AutoTokenizer
     from trl import SFTConfig, SFTTrainer
 
-    model_id = cfg["model"]["model_name_or_path"]
+    model_id = args.model_path.strip() if args.model_path.strip() else cfg["model"]["model_name_or_path"]
     tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -175,16 +182,26 @@ def main() -> None:
         print(f"[sft] Merging LoRA adapter into {args.merge_output_dir} for Stage 2 RLVR...")
         unwrapped = trainer.accelerator.unwrap_model(trainer.model)
         merged = unwrapped.merge_and_unload()
+        clean_sd = {
+            k.replace(".base_layer.", "."): v.to(torch.bfloat16)
+            for k, v in merged.state_dict().items()
+            if ".lora_A." not in k and ".lora_B." not in k and ".lora_embedding_" not in k
+        }
         args.merge_output_dir.mkdir(parents=True, exist_ok=True)
-        merged.save_pretrained(args.merge_output_dir, safe_serialization=True)
+        merged.save_pretrained(args.merge_output_dir, state_dict=clean_sd, safe_serialization=True, max_shard_size="5GB")
         tokenizer.save_pretrained(args.merge_output_dir)
-        # Save multimodal processor config so SGLang/vLLM can load Qwen3_5ForConditionalGeneration cleanly
-        try:
-            processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-            processor.save_pretrained(args.merge_output_dir)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[sft] Warning: AutoProcessor save skipped ({exc})")
-        print("[sft] Merged checkpoint saved.")
+        src_dir = Path(model_id)
+        if src_dir.is_dir():
+            for extra_name in (
+                "processor_config.json",
+                "preprocessor_config.json",
+                "video_preprocessor_config.json",
+                "chat_template.jinja",
+                "generation_config.json",
+            ):
+                if (src_dir / extra_name).exists() and not (args.merge_output_dir / extra_name).exists():
+                    shutil.copy2(src_dir / extra_name, args.merge_output_dir / extra_name)
+        print(f"[sft] Clean standalone BF16 checkpoint saved ({len(clean_sd)} keys).")
     trainer.accelerator.wait_for_everyone()
 
 

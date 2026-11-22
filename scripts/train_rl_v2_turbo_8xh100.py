@@ -354,7 +354,7 @@ def evaluate_v2_role_diverse_tree_5x(
         w1 = ordered_leaves[0].window_end if ordered_leaves else rec.inject_timestamp + 900
         msgs = build_v2_role_diverse_synthesis_prompt(rec, w0, w1, ordered_leaves)
         prompt_ids = _chat_template_ids(tokenizer, msgs, add_generation_prompt=True, reasoning_effort="medium")
-        _, raw_txt = _sglang_generate_tito(next(url_cyc), tokenizer, prompt_ids, 0.0, 896, im_end_id)
+        _, raw_txt = _sglang_generate_tito(next(url_cyc), tokenizer, prompt_ids, 0.0, 1536, im_end_id)
         sc = score_v2_counterfactual_synthesis_turn(raw_txt, rec, ordered_leaves)
         any_leaf_solved = any(lf.strict_solved for lf in ordered_leaves)
         return {
@@ -787,7 +787,7 @@ def main() -> None:
                 cf_end_id = (tokenizer.encode("<|im_end|>", add_special_tokens=False) or [int(tokenizer.eos_token_id)])[0]
 
                 def _cf_one(p_ids=cf_prompt_ids, end_id=cf_end_id, rec_c=cf_rec, lvs=cf_leaves) -> tuple[list[int], RolloutGroupItem]:
-                    oids, rtxt = _sglang_generate_tito(next(url_cycle), tokenizer, p_ids, 0.85, 896, end_id)
+                    oids, rtxt = _sglang_generate_tito(next(url_cycle), tokenizer, p_ids, 0.85, 1536, end_id)
                     if not oids or len(p_ids) >= args.max_train_seq_len - 8:
                         return list(p_ids[: args.max_train_seq_len]), RolloutGroupItem(-0.30, [0.0], [(0, 0)], min(len(p_ids), args.max_train_seq_len))
                     full_seq = (list(p_ids) + oids)[: args.max_train_seq_len]

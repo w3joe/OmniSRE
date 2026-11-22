@@ -418,7 +418,7 @@ class RawDuckDBExplorationEnv:
         self,
         config: HaystackConfig | None = None,
         seed: int = 42,
-        max_output_chars: int = 1800,
+        max_output_chars: int = 2400,
     ) -> None:
         self.cfg = config or HaystackConfig()
         self.rng = random.Random(seed)
@@ -488,8 +488,17 @@ class RawDuckDBExplorationEnv:
         def _map_svc(s: str) -> str:
             return self._canon_to_alias.get(s, s)
 
+        def _map_msg(msg: str) -> str:
+            if not use_aliasing:
+                return msg
+            out_m = msg
+            for canon_s, alias_s in self._canon_to_alias.items():
+                if canon_s and canon_s in out_m:
+                    out_m = out_m.replace(canon_s, alias_s)
+            return out_m
+
         mapped_metrics = [(ts, _map_svc(sv), m, val) for ts, sv, m, val in metric_rows]
-        mapped_logs = [(ts, _map_svc(sv), lvl, msg) for ts, sv, lvl, msg in log_rows]
+        mapped_logs = [(ts, _map_svc(sv), lvl, _map_msg(msg)) for ts, sv, lvl, msg in log_rows]
         mapped_traces = [
             (ts, tid, sid, pid, _map_svc(sv), op, dur, st)
             for ts, tid, sid, pid, sv, op, dur, st in trace_rows
@@ -735,28 +744,57 @@ class RawDuckDBExplorationEnv:
             met_re = str(args.get("metric_regex", "")).strip()
             t0 = int(args.get("start_ts") or self._window_start)
             t1 = int(args.get("end_ts") or self._window_end)
+            t_base_end = t0 + max(60, (t1 - t0) // 4)
             bucket = max(30, int(args.get("bucket_s") or 300))
             try:
                 rows = self._con.execute(
                     """
+                    WITH base_stats AS (
+                        SELECT
+                            service,
+                            metric,
+                            AVG(value) AS base_mean,
+                            GREATEST(COALESCE(STDDEV_SAMP(value), 0.0), ABS(AVG(value)) * 0.05 + 1e-3) AS base_sd
+                        FROM metrics
+                        WHERE ts BETWEEN ? AND ?
+                        GROUP BY 1, 2
+                    ),
+                    bucketed AS (
+                        SELECT
+                            m.service,
+                            m.metric,
+                            (m.ts // ?) * ? AS bucket_ts,
+                            ROUND(AVG(m.value), 4) AS avg_val,
+                            ROUND(MAX(m.value), 4) AS max_val,
+                            COUNT(*) AS n
+                        FROM metrics m
+                        WHERE m.ts BETWEEN ? AND ?
+                          AND (? = '' OR regexp_matches(m.service, ?))
+                          AND (? = '' OR regexp_matches(m.metric, ?))
+                        GROUP BY 1, 2, 3
+                    )
                     SELECT
-                        service,
-                        metric,
-                        (ts // ?) * ? AS bucket_ts,
-                        ROUND(AVG(value), 4) AS avg_val,
-                        ROUND(MAX(value), 4) AS max_val,
-                        COUNT(*) AS n
-                    FROM metrics
-                    WHERE ts BETWEEN ? AND ?
-                      AND (? = '' OR regexp_matches(service, ?))
-                      AND (? = '' OR regexp_matches(metric, ?))
-                    GROUP BY 1, 2, 3
-                    ORDER BY max_val DESC
-                    LIMIT 45
+                        bk.service,
+                        bk.metric,
+                        bk.bucket_ts,
+                        bk.avg_val,
+                        bk.max_val,
+                        ROUND(
+                            CASE
+                                WHEN bs.base_sd IS NOT NULL THEN ABS(bk.avg_val - bs.base_mean) / bs.base_sd
+                                ELSE 0.0
+                            END,
+                            2
+                        ) AS z_score,
+                        bk.n
+                    FROM bucketed bk
+                    LEFT JOIN base_stats bs USING (service, metric)
+                    ORDER BY z_score DESC, max_val DESC
+                    LIMIT 12
                     """,
-                    [bucket, bucket, t0, t1, svc_re, svc_re, met_re, met_re],
+                    [t0, t_base_end, bucket, bucket, t0, t1, svc_re, svc_re, met_re, met_re],
                 ).fetchall()
-                cols = ["service", "metric", "bucket_ts", "avg_val", "max_val", "n"]
+                cols = ["service", "metric", "bucket_ts", "avg_val", "max_val", "z_score", "n"]
                 return json.dumps([dict(zip(cols, r, strict=True)) for r in rows]), False, False, 0.02
             except duckdb.Error as exc:
                 return f"PROMQL_ERROR: {exc}", False, False, -0.01

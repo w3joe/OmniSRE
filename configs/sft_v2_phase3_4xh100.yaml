@@ -1,0 +1,54 @@
+# Phase 3: OmniSRE v2.0 Raw DuckDB SQL + Compaction + 5x Synthesis + K8s Write SFT Config (4x H100)
+model:
+  model_name_or_path: /mnt/nvme/omnisre-v1.0
+  trust_remote_code: true
+  torch_dtype: bfloat16
+  attn_implementation: sdpa
+  freeze_vision_tower: true
+  freeze_mtp_heads: true
+
+lora:
+  enabled: true
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - in_proj_qkv
+    - in_proj_z
+    - in_proj_a
+    - in_proj_b
+    - out_proj
+  exclude_modules:
+    - ".*visual.*"
+    - ".*vision_tower.*"
+    - ".*merger.*"
+    - ".*mtp.*"
+
+data:
+  train_jsonl: /mnt/nvme/data_phase3/sft_phase3_v2_mixed.jsonl
+  max_seq_length: 8192
+  assistant_only_loss: true
+  preserve_thinking: true
+
+training:
+  output_dir: /mnt/nvme/checkpoints_phase3/omnisre-v2-phase3-sft-lora64
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8   # Global batch = 32 trajectories across 4x H100 (~75-90 steps, ~18 min)
+  learning_rate: 1.5e-5            # Gentle calibration LR preserving OmniSRE v1.0 RLVR priors
+  lr_scheduler_type: cosine
+  warmup_steps: 10
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  bf16: true
+  gradient_checkpointing: true
+  logging_steps: 5
+  save_steps: 50
+  seed: 42
