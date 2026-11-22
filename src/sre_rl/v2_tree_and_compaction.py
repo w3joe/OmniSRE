@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+import numpy as np
+
 from sre_rl.env.real_telemetry_env import (
     RealIncidentRecord,
     _canonicalize_fault_set,
@@ -79,6 +81,36 @@ class LeafInvestigationArtifact:
     alias_to_canon: dict[str, str] | None = None
 
 
+def select_balanced_segments(
+    segments: list[tuple[list[int], list[float], list[float]]],
+    max_segments: int,
+    pos_fraction: float = 0.60,
+) -> list[tuple[list[int], list[float], list[float]]]:
+    """Select a sign-balanced subset of segments so high-penalty `-0.30` timeouts never crowd out `+` winners."""
+    valid = [s for s in segments if any(m > 0.0 for m in s[2][1:])]
+    if max_segments <= 0 or len(valid) <= max_segments:
+        return valid
+
+    def _mean_active_adv(seg: tuple[list[int], list[float], list[float]]) -> float:
+        vals = [a for a, m in zip(seg[1][1:], seg[2][1:], strict=False) if m > 0.0]
+        return float(np.mean(vals)) if vals else 0.0
+
+    scored = [(_mean_active_adv(s), idx, s) for idx, s in enumerate(valid)]
+    pos = sorted([x for x in scored if x[0] > 0.0], key=lambda x: x[0], reverse=True)
+    neg = sorted([x for x in scored if x[0] < 0.0], key=lambda x: abs(x[0]), reverse=True)
+
+    target_pos = min(len(pos), max(1, round(max_segments * pos_fraction)))
+    target_neg = min(len(neg), max_segments - target_pos)
+    if target_pos + target_neg < max_segments:
+        rem = max_segments - (target_pos + target_neg)
+        if len(pos) > target_pos:
+            target_pos = min(len(pos), target_pos + rem)
+        elif len(neg) > target_neg:
+            target_neg = min(len(neg), target_neg + rem)
+
+    return [x[2] for x in pos[:target_pos]] + [x[2] for x in neg[:target_neg]]
+
+
 def build_segmented_rollout_items(
     episodes_segments: list[list[CompactedSegmentRecord]],
     segment_discount: float = 0.92,
@@ -118,9 +150,15 @@ def build_segmented_rollout_items(
             n_turns = len(seg.turn_spans)
             for t_idx, (s_pos, e_pos) in enumerate(seg.turn_spans):
                 turn_decay = cfg.gamma ** max(0, (n_turns - 1 - t_idx))
+                allow_pos_shaping = (
+                    not cfg.gate_positive_shaping_on_success
+                    or seg.episode_outcome_reward >= cfg.min_group_max_reward
+                )
+                raw_turn_r = seg.turn_rewards[t_idx]
+                effective_turn_r = 0.0 if (not allow_pos_shaping and raw_turn_r > 0.0) else raw_turn_r
                 token_adv = base_ep_adv * seg_decay * (
                     (1.0 - cfg.outcome_dampening_lambda) + cfg.outcome_dampening_lambda * turn_decay
-                ) + seg.turn_rewards[t_idx]
+                ) + effective_turn_r
                 for pos in range(max(1, s_pos), min(len(seg.token_ids), e_pos)):
                     adv_vec[pos] = round(float(token_adv), 5)
                     mask_vec[pos] = 1.0

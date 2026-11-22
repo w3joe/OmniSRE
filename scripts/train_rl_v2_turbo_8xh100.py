@@ -68,6 +68,7 @@ from sre_rl.v2_tree_and_compaction import (
     build_v2_role_diverse_synthesis_prompt,
     is_disagreeing_counterfactual_leaf_set,
     score_v2_counterfactual_synthesis_turn,
+    select_balanced_segments,
 )
 from sre_rl.v5_sre1_upgrades import sample_group_harness
 
@@ -183,7 +184,7 @@ def rollout_v2_raw_compacted_tito(
     cfg: HaystackConfig,
     seed: int,
     role_name: str = "general_investigator",
-    max_new_tokens: int = 384,
+    max_new_tokens: int = 640,
     temperature: float = 0.85,
 ) -> tuple[list[CompactedSegmentRecord], dict[str, float], LeafInvestigationArtifact]:
     """Execute a 60-100 turn raw DuckDB investigation decomposed into `<5.6K`-token TITO segments."""
@@ -199,7 +200,7 @@ def rollout_v2_raw_compacted_tito(
                 tokenizer,
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_text}],
                 add_generation_prompt=True,
-                reasoning_effort="medium",
+                reasoning_effort="low",
             )
 
         token_stream = _start_fresh_segment(alert)
@@ -337,7 +338,7 @@ def evaluate_v2_role_diverse_tree_5x(
                 cfg,
                 sd,
                 rn,
-                384,
+                640,
                 0.35,
             ): (r_idx, l_idx)
             for r_idx, l_idx, rec, cfg, sd, rn in leaf_jobs
@@ -352,8 +353,8 @@ def evaluate_v2_role_diverse_tree_5x(
         w0 = ordered_leaves[0].window_start if ordered_leaves else rec.inject_timestamp - 900
         w1 = ordered_leaves[0].window_end if ordered_leaves else rec.inject_timestamp + 900
         msgs = build_v2_role_diverse_synthesis_prompt(rec, w0, w1, ordered_leaves)
-        prompt_ids = _chat_template_ids(tokenizer, msgs, add_generation_prompt=True, reasoning_effort="medium")
-        _, raw_txt = _sglang_generate_tito(next(url_cyc), tokenizer, prompt_ids, 0.0, 448, im_end_id)
+        prompt_ids = _chat_template_ids(tokenizer, msgs, add_generation_prompt=True, reasoning_effort="low")
+        _, raw_txt = _sglang_generate_tito(next(url_cyc), tokenizer, prompt_ids, 0.0, 896, im_end_id)
         sc = score_v2_counterfactual_synthesis_turn(raw_txt, rec, ordered_leaves)
         any_leaf_solved = any(lf.strict_solved for lf in ordered_leaves)
         return {
@@ -623,7 +624,7 @@ def main() -> None:
         eval_slice.extend(sub[: max(1, 30 // max(1, len(by_ho)))])
 
     counterfactual_bank: list[tuple[RealIncidentRecord, list[LeafInvestigationArtifact]]] = []
-    dapo_cfg = DAPOConfig(group_size=args.group_size, gamma=0.92, outcome_dampening_lambda=0.30, min_group_max_reward=0.15)
+    dapo_cfg = DAPOConfig(group_size=args.group_size, gamma=0.92, outcome_dampening_lambda=0.30, min_group_max_reward=0.40)
 
     def _sample_stratified_records(n: int) -> list[RealIncidentRecord]:
         keys = sorted(fault_buckets.keys())
@@ -639,7 +640,7 @@ def main() -> None:
         eval_cfg = HaystackConfig(max_turns=args.max_turns, segment_token_budget=args.max_train_seq_len, num_distractor_services=args.distractors, alias_services_prob=0.0)
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.rollout_workers, len(eval_slice))) as pool:
             futs = [
-                pool.submit(rollout_v2_raw_compacted_tito, next(url_cycle), tokenizer, rec, eval_cfg, 1000 + i, "eval", 384, 0.0)
+                pool.submit(rollout_v2_raw_compacted_tito, next(url_cycle), tokenizer, rec, eval_cfg, 1000 + i, "eval", 640, 0.0)
                 for i, rec in enumerate(eval_slice)
             ]
             st_list = [f.result()[1] for f in futs]
@@ -698,7 +699,7 @@ def main() -> None:
             grouped: dict[int, list] = {i: [] for i in range(n_cand_groups)}
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.rollout_workers) as pool:
                 fmap = {
-                    pool.submit(rollout_v2_raw_compacted_tito, next(url_cycle), tokenizer, r, hc, sd, rn, 384, 0.85): cp
+                    pool.submit(rollout_v2_raw_compacted_tito, next(url_cycle), tokenizer, r, hc, sd, rn, 640, 0.85): cp
                     for cp, r, hc, sd, rn in jobs
                 }
                 for fut, cp in fmap.items():
@@ -714,7 +715,7 @@ def main() -> None:
                     counterfactual_bank.append((rec, leaves))
                     if len(counterfactual_bank) > 400:
                         counterfactual_bank.pop(0)
-                if float(np.std(rews)) >= dapo_cfg.min_group_std and float(np.max(rews)) >= 0.15:
+                if float(np.std(rews)) >= dapo_cfg.min_group_std and float(np.max(rews)) >= dapo_cfg.min_group_max_reward:
                     scored_groups.append((float(np.std(rews)), cp))
 
             scored_groups.sort(key=lambda x: x[0], reverse=True)
@@ -782,11 +783,11 @@ def main() -> None:
                 w0 = cf_leaves[0].window_start if cf_leaves else cf_rec.inject_timestamp - 900
                 w1 = cf_leaves[0].window_end if cf_leaves else cf_rec.inject_timestamp + 900
                 cf_msgs = build_v2_role_diverse_synthesis_prompt(cf_rec, w0, w1, cf_leaves)
-                cf_prompt_ids = _chat_template_ids(tokenizer, cf_msgs, add_generation_prompt=True, reasoning_effort="medium")
+                cf_prompt_ids = _chat_template_ids(tokenizer, cf_msgs, add_generation_prompt=True, reasoning_effort="low")
                 cf_end_id = (tokenizer.encode("<|im_end|>", add_special_tokens=False) or [int(tokenizer.eos_token_id)])[0]
 
                 def _cf_one(p_ids=cf_prompt_ids, end_id=cf_end_id, rec_c=cf_rec, lvs=cf_leaves) -> tuple[list[int], RolloutGroupItem]:
-                    oids, rtxt = _sglang_generate_tito(next(url_cycle), tokenizer, p_ids, 0.85, 448, end_id)
+                    oids, rtxt = _sglang_generate_tito(next(url_cycle), tokenizer, p_ids, 0.85, 896, end_id)
                     if not oids or len(p_ids) >= args.max_train_seq_len - 8:
                         return list(p_ids[: args.max_train_seq_len]), RolloutGroupItem(-0.30, [0.0], [(0, 0)], min(len(p_ids), args.max_train_seq_len))
                     full_seq = (list(p_ids) + oids)[: args.max_train_seq_len]
@@ -798,20 +799,14 @@ def main() -> None:
                     cf_outs = [f.result() for f in [pool.submit(_cf_one) for _ in range(args.group_size)]]
                 cf_items = [x[1] for x in cf_outs]
                 cf_rw = np.array([it.outcome_reward for it in cf_items])
-                if float(np.std(cf_rw)) >= dapo_cfg.min_group_std and float(np.max(cf_rw)) >= 0.35:
+                if float(np.std(cf_rw)) >= dapo_cfg.min_group_std and float(np.max(cf_rw)) >= 0.40:
                     cf_advs, cf_masks = compute_gtpo_hybrid_advantages(cf_items, config=dapo_cfg)
                     for i_c, (seq_c, _) in enumerate(cf_outs):
                         if float(np.sum(cf_masks[i_c][: len(seq_c)][1:])) > 0.0:
                             payload_for_ranks.append((seq_c, list(cf_advs[i_c][: len(seq_c)]), list(cf_masks[i_c][: len(seq_c)])))
                             cf_synth_trained += 1
 
-            payload_for_ranks = [s for s in payload_for_ranks if any(m > 0.0 for m in s[2][1:])]
-            if args.max_segments_per_step > 0 and len(payload_for_ranks) > args.max_segments_per_step:
-                payload_for_ranks.sort(
-                    key=lambda s: max((abs(a) for a, m in zip(s[1][1:], s[2][1:], strict=False) if m > 0.0), default=0.0),
-                    reverse=True,
-                )
-                payload_for_ranks = payload_for_ranks[: args.max_segments_per_step]
+            payload_for_ranks = select_balanced_segments(payload_for_ranks, args.max_segments_per_step)
 
             usable = (len(payload_for_ranks) // world_size) * world_size
             payload_for_ranks = payload_for_ranks[:usable]

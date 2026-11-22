@@ -67,7 +67,7 @@ def eval_v2_raw_1x(
                     cfg,
                     5000 + idx,
                     "eval_1x",
-                    384,
+                    640,
                     0.0,
                 ),
             )

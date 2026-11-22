@@ -13,6 +13,7 @@ from sre_rl.v2_tree_and_compaction import (
     build_v2_role_diverse_synthesis_prompt,
     is_disagreeing_counterfactual_leaf_set,
     score_v2_counterfactual_synthesis_turn,
+    select_balanced_segments,
 )
 
 
@@ -279,3 +280,15 @@ def test_sregym_nested_cumulative_csv_parser(tmp_path: Path) -> None:
     assert summary["mitigation_pass_count"] == 1
     assert summary["mitigation_pass_rate"] == 0.5
     assert summary["diagnosis_composite_mean"] == 0.945
+
+
+def test_select_balanced_segments_preserves_positive_winners_over_timeout_outliers() -> None:
+    # 6 winning segments (+0.45 advantage) vs 10 high-magnitude timeout segments (-2.40 advantage)
+    pos_segs = [([1, 2, 3, 4], [0.0, 0.45, 0.45, 0.45], [0.0, 1.0, 1.0, 1.0]) for _ in range(6)]
+    neg_segs = [([1, 2, 3, 4], [0.0, -2.40, -2.40, -2.40], [0.0, 1.0, 1.0, 1.0]) for _ in range(10)]
+    chosen = select_balanced_segments(pos_segs + neg_segs, max_segments=10, pos_fraction=0.60)
+    assert len(chosen) == 10
+    n_pos = sum(1 for s in chosen if s[1][1] > 0.0)
+    n_neg = sum(1 for s in chosen if s[1][1] < 0.0)
+    assert n_pos == 6
+    assert n_neg == 4

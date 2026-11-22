@@ -45,6 +45,16 @@ Evaluated side-by-side against Base `Qwen/Qwen3.8-27B` on **100% unseen real pro
 | **All 129 Unseen Real Outages** | Solved / Avg Turns | `73.6%` (`14.6t`) | **`75.2%` (`4.1t`)** | **`3.6×` faster MTTR** |
 | **Oracle DB `DejaVu-C`** *(5× Tree Ensemble)* | Solved / Root Host | `65.7%` / `83.8%` | **`75.0%` / `100.0%`** | **`+9.3 pp`** |
 
+### Official Third-Party External Benchmarks (`microsoft/OpenRCA` + Live `SREGym-Lite`)
+
+| External Suite | Metric | Base `Qwen3.8-27B` | **`OmniSRE v1.0`** | Delta |
+| :--- | :--- | :---: | :---: | :---: |
+| **`microsoft/OpenRCA`** *(Telecom)* | Strict Root-Cause Accuracy | `0.0%` | **`6.7%`** | **`+6.7 pp`** |
+| **`microsoft/OpenRCA`** *(Telecom)* | Sandbox Crash Rate *(lower is better)* | `37.5%` | **`13.3%`** | **`-24.2 pp` (`2.8×` fewer)** |
+| **Live `SREGym-Lite`** *(17 Kind K8s faults)* | Diagnosis Pass / Composite | `17.6%` (`0.255`) | **`23.5%` (`0.301`)** | **`+5.9 pp` (`+33%` rel.)** |
+| **Live `SREGym-Lite`** *(17 Kind K8s faults)* | Live Cluster Mitigation Rate | `11.8%` (`2/17`) | **`17.6%` (`3/17`)** | **`+5.9 pp` (`1.5×`)** |
+| **Live `SREGym-Lite`** *(17 Kind K8s faults)* | End-to-End Run Completion | `41.2%` (`7/17`) | **`47.1%` (`8/17`)** | **`+5.9 pp`** |
+
 <br/>
 
 <img src="assets/omnisre_architecture.png" alt="Read-before-write agent loop and hybrid backbone" width="100%"/>
