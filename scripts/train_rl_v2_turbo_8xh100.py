@@ -200,7 +200,7 @@ def rollout_v2_raw_compacted_tito(
                 tokenizer,
                 [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_text}],
                 add_generation_prompt=True,
-                reasoning_effort="low",
+                reasoning_effort="medium",
             )
 
         token_stream = _start_fresh_segment(alert)
@@ -353,7 +353,7 @@ def evaluate_v2_role_diverse_tree_5x(
         w0 = ordered_leaves[0].window_start if ordered_leaves else rec.inject_timestamp - 900
         w1 = ordered_leaves[0].window_end if ordered_leaves else rec.inject_timestamp + 900
         msgs = build_v2_role_diverse_synthesis_prompt(rec, w0, w1, ordered_leaves)
-        prompt_ids = _chat_template_ids(tokenizer, msgs, add_generation_prompt=True, reasoning_effort="low")
+        prompt_ids = _chat_template_ids(tokenizer, msgs, add_generation_prompt=True, reasoning_effort="medium")
         _, raw_txt = _sglang_generate_tito(next(url_cyc), tokenizer, prompt_ids, 0.0, 896, im_end_id)
         sc = score_v2_counterfactual_synthesis_turn(raw_txt, rec, ordered_leaves)
         any_leaf_solved = any(lf.strict_solved for lf in ordered_leaves)
@@ -783,7 +783,7 @@ def main() -> None:
                 w0 = cf_leaves[0].window_start if cf_leaves else cf_rec.inject_timestamp - 900
                 w1 = cf_leaves[0].window_end if cf_leaves else cf_rec.inject_timestamp + 900
                 cf_msgs = build_v2_role_diverse_synthesis_prompt(cf_rec, w0, w1, cf_leaves)
-                cf_prompt_ids = _chat_template_ids(tokenizer, cf_msgs, add_generation_prompt=True, reasoning_effort="low")
+                cf_prompt_ids = _chat_template_ids(tokenizer, cf_msgs, add_generation_prompt=True, reasoning_effort="medium")
                 cf_end_id = (tokenizer.encode("<|im_end|>", add_special_tokens=False) or [int(tokenizer.eos_token_id)])[0]
 
                 def _cf_one(p_ids=cf_prompt_ids, end_id=cf_end_id, rec_c=cf_rec, lvs=cf_leaves) -> tuple[list[int], RolloutGroupItem]:
