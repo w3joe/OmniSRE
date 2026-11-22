@@ -292,3 +292,24 @@ def test_select_balanced_segments_preserves_positive_winners_over_timeout_outlie
     n_neg = sum(1 for s in chosen if s[1][1] < 0.0)
     assert n_pos == 6
     assert n_neg == 4
+
+
+def test_io_and_tion_fault_canonicalizer_regressions() -> None:
+    from sre_rl.env.real_telemetry_env import _canonicalize_fault_set, _canonicalize_fault_type
+
+    # "I/O" slash must NOT split into ('container read i', 'o load')
+    assert _canonicalize_fault_set("container read I/O load") == {"disk"}
+    assert _canonicalize_fault_set("container write I/O load") == {"disk"}
+    assert _canonicalize_fault_set("high disk I/O read usage") == {"disk"}
+
+    # "-tion" words ("execution", "contention", "termination", "consumption", "retransmission")
+    # must NOT falsely match substring "io" -> "disk"!
+    assert _canonicalize_fault_set("Execution") == {"lock_contention"}
+    assert _canonicalize_fault_type("Execution") == "lock_contention"
+    assert _canonicalize_fault_set("Row Lock Contention") == {"lock_contention"}
+    assert _canonicalize_fault_set("container process termination") == {"code_fault"}
+    assert _canonicalize_fault_set("node memory consumption") == {"mem"}
+    assert _canonicalize_fault_set("container network packet retransmission") == {"loss"}
+    assert _canonicalize_fault_set("db connection limit") == {"lock_contention", "socket"}
+    assert _canonicalize_fault_set("1") == {"other"}
+    assert _canonicalize_fault_set("f1") == {"code_fault"}

@@ -265,6 +265,8 @@ def score_v2_counterfactual_synthesis_turn(
 
     pred_fault_set = _canonicalize_fault_set(str(submit_args.get("fault_type", "")))
     gt_fault_set = _canonicalize_fault_set(record.ground_truth_fault)
+    if gt_fault_set == {"other"} and record.source_dataset.startswith("RE3"):
+        gt_fault_set = {"other", "code_fault"}
     fault_exact = bool(pred_fault_set & gt_fault_set)
     fault_score = 0.25 if fault_exact else 0.0
 

@@ -201,19 +201,24 @@ def _canonicalize_single_fault(token: str) -> set[str]:
     t = token.strip().lower()
     if not t or re.fullmatch(r"\d+", t):
         return {"other"}
+    if re.fullmatch(r"f\d+", t):
+        return {"code_fault"}
 
     out: set[str] = set()
     if any(k in t for k in ("cpu", "throttl")):
         out.add("cpu")
     if any(k in t for k in ("mem", "oom", "heap")):
         out.add("mem")
-    if any(k in t for k in ("logfile", "dbfile", "asm control", "disk", "io", "storage", "fs", "redo")):
+    if (
+        any(k in t for k in ("logfile", "dbfile", "asm control", "disk", "storage", "fs", "redo"))
+        or re.search(r"\b(io|iops)\b", t) is not None
+    ):
         out.add("disk")
     if "dbfile" in t:
         out.add("lock_contention")
     if any(k in t for k in ("delay", "latenc", "slow", "timeout")):
         out.add("delay")
-    if any(k in t for k in ("loss", "drop", "packet")):
+    if any(k in t for k in ("loss", "drop", "packet", "retransmi", "corrupt")):
         out.add("loss")
     if "network" in t and not ({"delay", "loss"} & out):
         # Generic "OS Network" fault without delay/loss subtype accepts any network-class diagnosis
@@ -238,7 +243,7 @@ def _canonicalize_single_fault(token: str) -> set[str]:
         )
     ):
         out.add("lock_contention")
-    if re.fullmatch(r"f\d+", t) or any(k in t for k in ("code", "bug", "app", "exception", "500")):
+    if any(k in t for k in ("code", "bug", "app", "exception", "500", "terminat", "crash", "kill")):
         out.add("code_fault")
 
     return out or {t}
@@ -246,7 +251,8 @@ def _canonicalize_single_fault(token: str) -> set[str]:
 
 def _canonicalize_fault_set(raw: str) -> set[str]:
     """Map single or compound (`;`-delimited) real fault labels into the canonical fault taxonomy."""
-    parts = [p.strip() for p in re.split(r"[;,|/]+", raw) if p.strip()]
+    normalized = re.sub(r"\bi\s*/\s*o\b", "io", raw, flags=re.IGNORECASE)
+    parts = [p.strip() for p in re.split(r"[;,|/]+", normalized) if p.strip()]
     if not parts:
         return {"other"}
     merged: set[str] = set()

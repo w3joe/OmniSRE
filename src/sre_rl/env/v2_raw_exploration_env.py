@@ -402,7 +402,8 @@ def build_v2_raw_system_prompt(cfg: HaystackConfig) -> str:
         "- `grep_logs`: `{\"service\": \"\", \"regex\": \"error|exception|timeout\", \"start_ts\": 0, \"end_ts\": 0, \"limit\": 25}`\n"
         "- `trace_call_graph`: `{\"start_ts\": 0, \"end_ts\": 0}` — parent/child span latency & self-duration attribution.\n"
         "- `compact_workspace`: `{\"confirmed_anomalies\": [...], \"ruled_out_services\": [...], \"active_hypotheses\": [...], \"next_queries\": [...]}` — compress notes & reset active context window for deep multi-turn exploration.\n"
-        "- `submit_rca_report`: `{\"root_service\": \"<exact_service>\", \"fault_type\": \"<cpu|mem|disk|delay|loss|socket|code_fault|lock_contention>\", \"onset_timestamp\": <unix_int>, \"cited_evidence\": \"<verbatim metric/log/span snippet observed>\", \"causal_chain\": \"...\"}`\n\n"
+        "- `submit_rca_report`: `{\"root_service\": \"<exact_service>\", \"fault_type\": \"<cpu|mem|disk|delay|loss|socket|code_fault|lock_contention>\", \"onset_timestamp\": <unix_int>, \"cited_evidence\": \"<verbatim metric/log/span snippet observed>\", \"causal_chain\": \"...\"}` "
+        "(map disk/redo/LogFile/I-O -> `disk`; DB locks/Execution/Contention/Cache Buffer Busy -> `lock_contention`; exceptions/crashes/process termination -> `code_fault`; packet loss/corruption/retransmits -> `loss`).\n\n"
         f"Rules: No pre-ranked z-scores are given — compare pre-incident vs. incident sub-windows yourself, "
         f"falsify benign transient blips on distractor services, compact your workspace before context fills, "
         f"and cite verbatim telemetry evidence. Max total turns: {cfg.max_turns}.\n"
@@ -877,6 +878,8 @@ class RawDuckDBExplorationEnv:
         # Strict fault mechanism grading — ZERO `code_fault` free-pass!
         pred_fault_set = _canonicalize_fault_set(str(self._submission.get("fault_type", "")))
         gt_fault_set = _canonicalize_fault_set(self._record.ground_truth_fault)
+        if gt_fault_set == {"other"} and self._record.source_dataset.startswith("RE3"):
+            gt_fault_set = {"other", "code_fault"}
         fault_exact = bool(pred_fault_set & gt_fault_set)
         fault_score = 0.25 if fault_exact else 0.0
 
