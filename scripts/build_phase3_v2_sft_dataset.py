@@ -57,19 +57,25 @@ FORBIDDEN_HELDOUT_DATASETS: frozenset[str] = frozenset(
 
 ZSCORE_DISCOVERY_SQL = (
     "WITH win AS ("
-    "SELECT MIN(ts) AS t0, MAX(ts) AS t1, MIN(ts) + (MAX(ts) - MIN(ts)) // 4 AS t_base FROM metrics"
+    "SELECT MIN(ts) + (MAX(ts) - MIN(ts)) // 4 AS t_base, "
+    "MIN(ts) + (MAX(ts) - MIN(ts)) // 2 AS t_late FROM metrics"
     "), base AS ("
-    "SELECT m.service, m.metric, AVG(m.value) AS base_avg, "
-    "GREATEST(COALESCE(STDDEV_SAMP(m.value), 0.0), ABS(AVG(m.value)) * 0.05 + 1e-3) AS base_sd "
+    "SELECT m.service, m.metric, QUANTILE_CONT(m.value, 0.5) AS b_med, "
+    "GREATEST(COALESCE(STDDEV_SAMP(m.value), 0.0), ABS(QUANTILE_CONT(m.value, 0.5)) * 0.10 + 0.05) AS b_sd "
     "FROM metrics m, win WHERE m.ts <= win.t_base GROUP BY 1, 2 HAVING COUNT(*) >= 2"
     "), inc AS ("
-    "SELECT m.service, m.metric, AVG(m.value) AS inc_avg, MAX(m.value) AS inc_max, COUNT(*) AS n_inc "
-    "FROM metrics m, win WHERE m.ts > win.t_base GROUP BY 1, 2 HAVING COUNT(*) >= 2"
+    "SELECT m.service, m.metric, QUANTILE_CONT(m.value, 0.5) AS i_med, "
+    "MAX(m.value) AS i_max, COUNT(*) AS n_inc "
+    "FROM metrics m, win WHERE m.ts >= win.t_late GROUP BY 1, 2 HAVING COUNT(*) >= 2"
     ") "
-    "SELECT i.service, i.metric, ROUND(b.base_avg, 4) AS base_avg, ROUND(i.inc_avg, 4) AS inc_avg, "
-    "ROUND(i.inc_max, 4) AS inc_max, ROUND(ABS(i.inc_avg - b.base_avg) / b.base_sd, 2) AS z_score, i.n_inc "
+    "SELECT i.service, i.metric, ROUND(b.b_med, 4) AS base_med, ROUND(i.i_med, 4) AS inc_med, "
+    "ROUND(ABS(i.i_med - b.b_med) / b.b_sd, 2) AS med_z, "
+    "ROUND(ABS(i.i_med - b.b_med) / GREATEST(ABS(b.b_med), 0.003), 2) AS rel_jump "
     "FROM inc i JOIN base b USING (service, metric) "
-    "ORDER BY z_score DESC LIMIT 10"
+    "ORDER BY CASE "
+    "WHEN regexp_matches(lower(i.metric), 'latenc|rt|duration') "
+    "THEN (ABS(i.i_med - b.b_med) / GREATEST(ABS(b.b_med), 0.003)) "
+    "ELSE (ABS(i.i_med - b.b_med) / b.b_sd) * 2.5 END DESC LIMIT 10"
 )
 
 
@@ -211,11 +217,13 @@ def synthesize_v2_raw_expert_trajectory(
         inflection_sql = (
             "WITH win AS (SELECT MIN(ts) + (MAX(ts) - MIN(ts)) // 4 AS t_base FROM metrics), "
             "base AS ("
-            f"SELECT service, metric, AVG(value) AS mu, GREATEST(COALESCE(STDDEV_SAMP(value), 0.0), ABS(AVG(value)) * 0.05 + 1e-3) AS sd "
+            f"SELECT service, metric, QUANTILE_CONT(value, 0.5) AS mu, "
+            f"GREATEST(COALESCE(STDDEV_SAMP(value), 0.0), ABS(QUANTILE_CONT(value, 0.5)) * 0.10 + 0.05) AS sd "
             f"FROM metrics, win WHERE ts <= win.t_base AND service IN ({quoted_svcs}) GROUP BY 1, 2"
             ") "
             "SELECT m.service, m.metric, MIN(m.ts) AS first_anom_ts, COUNT(*) AS anom_points, "
-            "ROUND(MAX(ABS(m.value - b.mu) / b.sd), 2) AS peak_z "
+            "ROUND(MAX(ABS(m.value - b.mu) / b.sd), 2) AS peak_z, "
+            "ROUND(QUANTILE_CONT(ABS(m.value - b.mu) / GREATEST(ABS(b.mu), 0.003), 0.5), 2) AS med_rel_jump "
             f"FROM metrics m JOIN base b USING (service, metric), win "
             f"WHERE m.ts > win.t_base AND m.service IN ({quoted_svcs}) AND ABS(m.value - b.mu) > 3.0 * b.sd "
             "GROUP BY 1, 2 HAVING COUNT(*) >= 2 "
@@ -244,8 +252,16 @@ def synthesize_v2_raw_expert_trajectory(
             p3 = json.loads(first_chunk)
             rows3 = p3.get("rows", []) if isinstance(p3, dict) else []
             if rows3:
-                # Pick among top z-score candidates the earliest sustained onset with strong peak_z
-                best_row = max(rows3, key=lambda r: (float(r.get("peak_z", 0.0)) >= 5.0, -int(r.get("first_anom_ts", 10**12))))
+                # Prefer top-ranked Turn-2 candidate (`top_candidates[0]`) when its sustained onset is near earliest!
+                earliest_ts = min(int(r.get("first_anom_ts", 10**12)) for r in rows3)
+                near_earliest = [
+                    r for r in rows3 if int(r.get("first_anom_ts", 10**12)) <= earliest_ts + 60
+                ]
+                rank_map = {sv: idx for idx, sv in enumerate(top_candidates)}
+                best_row = min(
+                    near_earliest or rows3,
+                    key=lambda r: (rank_map.get(str(r.get("service", "")), 99), int(r.get("first_anom_ts", 10**12))),
+                )
                 chosen_svc = str(best_row["service"])
                 chosen_onset = int(best_row["first_anom_ts"])
         except (json.JSONDecodeError, KeyError, ValueError):

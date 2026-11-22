@@ -462,14 +462,30 @@ class RawDuckDBExplorationEnv:
         self._submission = None
         self._done = False
 
-        # 1. Jitter alert window so `t_inject` is hidden inside a 20-45 minute window
+        # 1. Jitter alert window so `t_inject` is hidden inside a noisy window, then clamp to actual
+        #    recorded real-telemetry bounds so distractors & real services share the exact same time span!
         pre_s = self.rng.randint(self.cfg.window_pre_min_s, self.cfg.window_pre_max_s)
         post_s = self.rng.randint(self.cfg.window_post_min_s, self.cfg.window_post_max_s)
-        self._window_start = record.inject_timestamp - pre_s
-        self._window_end = record.inject_timestamp + post_s
+        req_start = record.inject_timestamp - pre_s
+        req_end = record.inject_timestamp + post_s
 
-        # 2. Load real telemetry rows + multiplex noisy healthy distractor haystack into in-RAM DuckDB
-        metric_rows, real_svcs = self._extract_real_metrics(record, self._window_start, self._window_end)
+        # 2. Load real telemetry rows + clamp window to real recording coverage
+        metric_rows, real_svcs = self._extract_real_metrics(record, req_start, req_end)
+        if metric_rows:
+            real_t0 = metric_rows[0][0]
+            real_t1 = metric_rows[-1][0]
+            if real_t1 > real_t0 + 120:
+                # Jitter slightly inside real bounds (`0..60s` trim) so `t_inject - window_start` is never constant!
+                trim_l = self.rng.randint(0, min(60, max(0, (record.inject_timestamp - real_t0) // 3)))
+                trim_r = self.rng.randint(0, min(60, max(0, (real_t1 - record.inject_timestamp) // 3)))
+                self._window_start = real_t0 + trim_l
+                self._window_end = real_t1 - trim_r
+                metric_rows = [r for r in metric_rows if self._window_start <= r[0] <= self._window_end]
+            else:
+                self._window_start, self._window_end = req_start, req_end
+        else:
+            self._window_start, self._window_end = req_start, req_end
+
         log_rows = self._extract_real_logs(record, self._window_start, self._window_end)
         trace_rows = self._extract_real_traces(record, self._window_start, self._window_end)
 
@@ -753,8 +769,12 @@ class RawDuckDBExplorationEnv:
                         SELECT
                             service,
                             metric,
-                            AVG(value) AS base_mean,
-                            GREATEST(COALESCE(STDDEV_SAMP(value), 0.0), ABS(AVG(value)) * 0.05 + 1e-3) AS base_sd
+                            QUANTILE_CONT(value, 0.5) AS base_mean,
+                            GREATEST(
+                                COALESCE(STDDEV_SAMP(value), 0.0),
+                                ABS(QUANTILE_CONT(value, 0.5)) * 0.10
+                                + CASE WHEN ABS(QUANTILE_CONT(value, 0.5)) < 1.0 THEN 0.01 ELSE 0.05 END
+                            ) AS base_sd
                         FROM metrics
                         WHERE ts BETWEEN ? AND ?
                         GROUP BY 1, 2
