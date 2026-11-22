@@ -22,8 +22,10 @@ blocking any held-out dataset (`OpenRCA-Telecom`, `OpenRCA-Market/cloudbed-2`, `
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import random
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -513,25 +515,42 @@ def main() -> None:
 
     duckdb_rows: list[dict[str, Any]] = []
     attempts = 0
-    max_attempts = args.target_duckdb_rows * 6
-    while len(duckdb_rows) < args.target_duckdb_rows and attempts < max_attempts:
-        fk = fault_keys[attempts % len(fault_keys)]
-        rec = rng.choice(by_fault[fk])
-        cfg = HaystackConfig(
-            max_turns=35,
-            segment_token_budget=4864,
-            num_distractor_services=40,
-            alias_services_prob=0.50,
-        )
-        rows = synthesize_v2_raw_expert_trajectory(
-            record=rec,
-            cfg=cfg,
-            seed=args.seed + attempts * 13,
-            use_promql_discovery=(attempts % 4 == 3),
-            use_compaction=(attempts % 5 in (1, 2)),
-        )
-        duckdb_rows.extend(rows)
-        attempts += 1
+    max_attempts = min(3600, args.target_duckdb_rows * 3)
+    batch_size = 128
+    t_start = time.time()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+        while len(duckdb_rows) < args.target_duckdb_rows and attempts < max_attempts:
+            cur_batch = min(batch_size, max_attempts - attempts)
+            futs = []
+            for b_i in range(cur_batch):
+                att_id = attempts + b_i
+                fk = fault_keys[att_id % len(fault_keys)]
+                rec = rng.choice(by_fault[fk])
+                cfg = HaystackConfig(
+                    max_turns=35,
+                    segment_token_budget=4864,
+                    num_distractor_services=40,
+                    alias_services_prob=0.50,
+                )
+                futs.append(
+                    pool.submit(
+                        synthesize_v2_raw_expert_trajectory,
+                        rec,
+                        cfg,
+                        args.seed + att_id * 13,
+                        att_id % 4 == 3,
+                        att_id % 5 in (1, 2),
+                    )
+                )
+            for fut in futs:
+                duckdb_rows.extend(fut.result())
+            attempts += cur_batch
+            print(
+                f"[phase3-sft] progress: {len(duckdb_rows)}/{args.target_duckdb_rows} DuckDB rows "
+                f"from {attempts} attempts ({time.time() - t_start:.1f}s)",
+                flush=True,
+            )
 
     cf5x_rows: list[dict[str, Any]] = []
     for idx in range(args.target_cf5x_rows * 2):

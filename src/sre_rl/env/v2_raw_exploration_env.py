@@ -84,7 +84,7 @@ def _get_or_parse_v2_logs_file(logs_path: str | None) -> tuple[np.ndarray, list[
         ts_arr = np.array([r[0] for r in rows], dtype=np.int64)
         entry = (ts_arr, rows)
         with _V2_CACHE_LOCK:
-            if len(_V2_LOGS_CACHE) > 64:
+            if len(_V2_LOGS_CACHE) > 2048:
                 _V2_LOGS_CACHE.clear()
             _V2_LOGS_CACHE[logs_path] = entry
         return entry
@@ -130,7 +130,7 @@ def _get_or_parse_v2_traces_file(
         ts_arr = np.array([r[0] for r in rows], dtype=np.int64)
         entry = (ts_arr, rows)
         with _V2_CACHE_LOCK:
-            if len(_V2_TRACES_CACHE) > 64:
+            if len(_V2_TRACES_CACHE) > 2048:
                 _V2_TRACES_CACHE.clear()
             _V2_TRACES_CACHE[traces_path] = entry
         return entry
@@ -238,7 +238,7 @@ def _get_or_parse_v2_metrics_file(
         ts_arr = np.array([r[0] for r in rows], dtype=np.int64)
         entry = (ts_arr, rows, svcs)
         with _V2_CACHE_LOCK:
-            if len(_V2_METRICS_CACHE) > 64:
+            if len(_V2_METRICS_CACHE) > 2048:
                 _V2_METRICS_CACHE.clear()
             _V2_METRICS_CACHE[cache_key] = entry
         return entry
