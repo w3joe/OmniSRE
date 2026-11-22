@@ -216,23 +216,40 @@ def _get_or_parse_v2_metrics_file(
             finally:
                 tmp_con.close()
         elif rec.is_dejavu_long_format:
-            with target.open("r", encoding="utf-8", errors="ignore") as fh:
-                for r in csv.DictReader(fh):
-                    try:
-                        ts = int(float(r["timestamp"]))
-                        val = float(r["value"])
-                    except (KeyError, ValueError):
+            tmp_con = duckdb.connect(":memory:")
+            try:
+                fsize_mb = target.stat().st_size / (1024 * 1024)
+                stride = max(1, int(fsize_mb // 25))
+                fetched = tmp_con.execute(
+                    f"""
+                    WITH raw AS (
+                        SELECT row_number() OVER () AS rn, * FROM read_csv_auto(?, ignore_errors=true)
+                    )
+                    SELECT
+                        TRY_CAST(TRY_CAST(timestamp AS DOUBLE) AS BIGINT) AS ts,
+                        CAST(name AS VARCHAR) AS raw_name,
+                        ROUND(TRY_CAST(value AS DOUBLE), 5) AS val
+                    FROM raw
+                    WHERE rn % {stride} = 0
+                      AND TRY_CAST(timestamp AS DOUBLE) IS NOT NULL
+                      AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+                      AND NOT isnan(TRY_CAST(value AS DOUBLE))
+                    """,
+                    [str(target)],
+                ).fetchall()
+                for ts, raw_name, val in fetched:
+                    if ts is None or val is None:
                         continue
-                    if not np.isfinite(val):
-                        continue
-                    raw_name = str(r.get("name", "")).strip()
-                    if "##" in raw_name:
-                        p_svc, m_name = raw_name.split("##", 1)
+                    rn_s = str(raw_name).strip()
+                    if "##" in rn_s:
+                        p_svc, m_name = rn_s.split("##", 1)
                         svc = p_svc or default_host
                     else:
-                        svc, m_name = default_host, raw_name
+                        svc, m_name = default_host, rn_s
                     svcs.add(svc)
-                    rows.append((ts, svc, m_name, round(val, 5)))
+                    rows.append((int(ts), svc, m_name, float(val)))
+            finally:
+                tmp_con.close()
         else:
             with target.open("r", encoding="utf-8", errors="ignore") as fh:
                 reader = csv.reader(fh)

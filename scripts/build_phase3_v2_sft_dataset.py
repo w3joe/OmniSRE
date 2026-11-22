@@ -519,7 +519,7 @@ def main() -> None:
     batch_size = 128
     t_start = time.time()
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=24) as pool:
         while len(duckdb_rows) < args.target_duckdb_rows and attempts < max_attempts:
             cur_batch = min(batch_size, max_attempts - attempts)
             futs = []
