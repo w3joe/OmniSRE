@@ -35,6 +35,8 @@ Zero-contamination evaluation on **100% unseen real production systems** (`DejaV
 | **Real Prod RCA** *(all 129 unseen outages)* | Exact Root Service | `87.6%` | **`99.2%`** *(128/129)* | **`+11.6 pp`** |
 | **Real Prod RCA** *(all 129 unseen outages)* | Solved / Avg Turns | `73.6%` (`14.6` turns) | **`75.2%` (`4.1` turns)** | **`3.6×` faster MTTR** |
 | **Oracle DB `DejaVu-C`** *(5× Tree Ensemble)* | Solved / Root Host | `65.7%` / `83.8%` | **`75.0%` / `100.0%`** | **`+9.3 pp`** |
+| **Live K8s `SREGym-Lite`** *(17 live 4-node Kind faults, 8m cap)* | Live Cluster Mitigation / Diagnosis | `11.8%` / `17.6%` | **`17.6%` / `23.5%`** | **`1.5×` mit. / `+5.9 pp` diag.** |
+| **`microsoft/OpenRCA` (`Telecom`)** *(Docker Pandas sandbox)* | Strict 3-Way Acc / Crash Rate | `0.0%` / `37.5%` (`44m`/task) | **`6.7%` / `13.3%` (`14m`/task)** | **`3.1×` faster · `2.8×` fewer crashes** |
 
 ---
 

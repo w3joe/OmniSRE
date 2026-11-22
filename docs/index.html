@@ -751,6 +751,51 @@
         </table>
       </div>
 
+      <h3>Table 3 — Official Third-Party External Benchmarks (Live 4-Node Kind <code>SREGym-Lite</code> &amp; <code>microsoft/OpenRCA</code>)</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>External Benchmark</th>
+              <th>Environment</th>
+              <th>Model</th>
+              <th class="num">Primary Pass Rate</th>
+              <th class="num">Secondary Metric</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>SREGym-Lite</code> (17 Live K8s Faults, 480s cap)</td>
+              <td>4-node Kind + Calico + Prometheus/Jaeger/Loki</td>
+              <td><code>Qwen/Qwen3.8-27B</code> (Base + Stratus)</td>
+              <td class="num">11.8% Mitigated (2/17)</td>
+              <td class="num">17.6% Diagnosed · 5.9% Full E2E</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong><code>SREGym-Lite</code> (17 Live K8s Faults, 480s cap)</strong></td>
+              <td>4-node Kind + Calico + Prometheus/Jaeger/Loki</td>
+              <td><strong><code>OmniSRE-27B v1.0</code> (Ours + Stratus)</strong></td>
+              <td class="num"><span class="gain">17.6% Mitigated (1.5&times;)</span></td>
+              <td class="num"><span class="gain">23.5% Diagnosed · 11.8% Full E2E (2.0&times;)</span></td>
+            </tr>
+            <tr>
+              <td><code>microsoft/OpenRCA</code> (<code>Telecom</code>)</td>
+              <td>Dockerized Python/Pandas over raw CSVs</td>
+              <td><code>Qwen/Qwen3.8-27B</code> (Base + RCA-Agent)</td>
+              <td class="num">0.0% Strict (0/8)</td>
+              <td class="num">37.5% Sandbox Crashes · ~44m/task</td>
+            </tr>
+            <tr class="highlight">
+              <td><strong><code>microsoft/OpenRCA</code> (<code>Telecom</code>)</strong></td>
+              <td>Dockerized Python/Pandas over raw CSVs</td>
+              <td><strong><code>OmniSRE-27B v1.0</code> (Ours + RCA-Agent)</strong></td>
+              <td class="num"><span class="gain">6.7% Strict (1/15)</span></td>
+              <td class="num"><span class="gain">13.3% Sandbox Crashes · ~14m/task (3.1&times; faster)</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
       <h2 id="ablations"><span class="sec-no">SECTION 05</span>Training Dynamics, Engineering Lessons &amp; Open Limitations</h2>
       <p>
         Tracking stratified unseen held-out evaluations every 25 RLVR steps surfaced two critical engineering phenomena that shaped <code>v1.0</code> and inform our <code>v2.0</code> roadmap:
