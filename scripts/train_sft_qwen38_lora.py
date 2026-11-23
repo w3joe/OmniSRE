@@ -145,33 +145,82 @@ def main() -> None:
 
     t_cfg = cfg["training"]
     out_dir = str(args.output_dir) if args.output_dir is not None else t_cfg["output_dir"]
-    sft_args = SFTConfig(
-        output_dir=out_dir,
-        dataset_text_field="text",
-        max_length=int(cfg["data"]["max_seq_length"]),
-        num_train_epochs=float(t_cfg["num_train_epochs"]),
-        max_steps=int(args.max_steps),
-        per_device_train_batch_size=int(t_cfg["per_device_train_batch_size"]),
-        gradient_accumulation_steps=int(t_cfg["gradient_accumulation_steps"]),
-        learning_rate=float(t_cfg["learning_rate"]),
-        lr_scheduler_type=t_cfg["lr_scheduler_type"],
-        warmup_steps=int(t_cfg.get("warmup_steps", 15)),
-        weight_decay=float(t_cfg["weight_decay"]),
-        max_grad_norm=float(t_cfg["max_grad_norm"]),
-        bf16=True,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=int(t_cfg["logging_steps"]),
-        save_steps=int(t_cfg["save_steps"]),
-        seed=int(t_cfg["seed"]),
-        report_to="none",
-    )
+    assistant_only = bool(cfg["data"].get("assistant_only_loss", True))
+
+    sft_kwargs: dict[str, object] = {
+        "output_dir": out_dir,
+        "dataset_text_field": "text",
+        "max_length": int(cfg["data"]["max_seq_length"]),
+        "num_train_epochs": float(t_cfg["num_train_epochs"]),
+        "max_steps": int(args.max_steps),
+        "per_device_train_batch_size": int(t_cfg["per_device_train_batch_size"]),
+        "gradient_accumulation_steps": int(t_cfg["gradient_accumulation_steps"]),
+        "learning_rate": float(t_cfg["learning_rate"]),
+        "lr_scheduler_type": t_cfg["lr_scheduler_type"],
+        "warmup_steps": int(t_cfg.get("warmup_steps", 15)),
+        "weight_decay": float(t_cfg["weight_decay"]),
+        "max_grad_norm": float(t_cfg["max_grad_norm"]),
+        "bf16": True,
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        "logging_steps": int(t_cfg["logging_steps"]),
+        "save_steps": int(t_cfg["save_steps"]),
+        "seed": int(t_cfg["seed"]),
+        "report_to": "none",
+    }
+    import inspect
+
+    if "assistant_only_loss" in inspect.signature(SFTConfig.__init__).parameters:
+        sft_kwargs["assistant_only_loss"] = assistant_only
+    sft_args = SFTConfig(**sft_kwargs)  # type: ignore[arg-type]
+
+    # Version-proof assistant-only label masking collator (`labels = -100` outside `<|im_start|>assistant ... <|im_end|>`)
+    im_start_assistant = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    im_end_toks = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+    im_end_id = im_end_toks[0] if im_end_toks else int(tokenizer.eos_token_id)
+
+    def _assistant_only_collator(features: list[dict[str, object]]) -> dict[str, torch.Tensor]:
+        batch_ids: list[list[int]] = []
+        for f in features:
+            if "input_ids" in f:
+                ids = [int(x) for x in f["input_ids"]]  # type: ignore[union-attr]
+            else:
+                ids = tokenizer.encode(str(f["text"]), add_special_tokens=False)[: int(cfg["data"]["max_seq_length"])]
+            batch_ids.append(ids)
+        max_l = max(len(x) for x in batch_ids)
+        pad_id = int(tokenizer.pad_token_id)
+        in_ten = torch.full((len(batch_ids), max_l), pad_id, dtype=torch.long)
+        att_ten = torch.zeros((len(batch_ids), max_l), dtype=torch.long)
+        lbl_ten = torch.full((len(batch_ids), max_l), -100, dtype=torch.long)
+
+        pat_len = len(im_start_assistant)
+        for row_i, ids in enumerate(batch_ids):
+            in_ten[row_i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+            att_ten[row_i, : len(ids)] = 1
+            if not assistant_only or pat_len == 0:
+                lbl_ten[row_i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+                continue
+            pos = 0
+            while pos <= len(ids) - pat_len:
+                if ids[pos : pos + pat_len] == im_start_assistant:
+                    start_gen = pos + pat_len
+                    end_gen = start_gen
+                    while end_gen < len(ids) and ids[end_gen] != im_end_id:
+                        end_gen += 1
+                    if end_gen < len(ids) and ids[end_gen] == im_end_id:
+                        end_gen += 1
+                    lbl_ten[row_i, start_gen:end_gen] = torch.tensor(ids[start_gen:end_gen], dtype=torch.long)
+                    pos = end_gen
+                else:
+                    pos += 1
+        return {"input_ids": in_ten, "attention_mask": att_ten, "labels": lbl_ten}
 
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         train_dataset=train_ds,
         args=sft_args,
+        data_collator=_assistant_only_collator if assistant_only else None,
     )
     trainer.train()
     trainer.save_model(out_dir)

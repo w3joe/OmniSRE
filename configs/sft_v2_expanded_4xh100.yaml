@@ -1,4 +1,5 @@
-# Phase 3: OmniSRE v2.0 Raw DuckDB SQL + Compaction + 5x Synthesis + K8s Write SFT Config (4x H100)
+# OmniSRE v2.0 Assistant-Masked Exact-Schema Calibration SFT Config (4x H100)
+# Evolves directly on top of OmniSRE v1.0 with expanded 22-fault K8s/SREGym + OpenRCA structured priors.
 model:
   model_name_or_path: /mnt/nvme/omnisre-v1.0
   trust_remote_code: true
@@ -32,19 +33,19 @@ lora:
     - ".*mtp.*"
 
 data:
-  train_jsonl: /mnt/nvme/data_phase3/sft_phase3_v2_mixed.jsonl
+  train_jsonl: /mnt/nvme/data_v2_expanded/sft_v2_expanded_calibration.jsonl
   max_seq_length: 8192
   assistant_only_loss: true
   preserve_thinking: true
 
 training:
-  output_dir: /mnt/nvme/checkpoints_phase3/omnisre-v2-phase3-sft-lora64
+  output_dir: /mnt/nvme/checkpoints_v2/sft-lora64
   num_train_epochs: 1
   per_device_train_batch_size: 1
-  gradient_accumulation_steps: 8   # Global batch = 32 trajectories across 4x H100 (~75-90 steps, ~18 min)
-  learning_rate: 1.5e-5            # Gentle calibration LR preserving OmniSRE v1.0 RLVR priors
+  gradient_accumulation_steps: 8   # Global batch = 32 trajectories across 4x H100 (~95 steps, ~15 min)
+  learning_rate: 2.0e-5
   lr_scheduler_type: cosine
-  warmup_steps: 10
+  warmup_steps: 12
   weight_decay: 0.01
   max_grad_norm: 1.0
   bf16: true

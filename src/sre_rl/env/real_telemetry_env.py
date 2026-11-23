@@ -396,7 +396,9 @@ class RealTelemetryReplayEnvironment:
                 self._metrics_cache = cached
                 return cached
 
-        if rec.is_dejavu_long_format:
+        if rec.source_dataset.startswith("OpenRCA-"):
+            cache = self._load_openrca_metrics(target_p, t_start, t0, t_end)
+        elif rec.is_dejavu_long_format:
             cache = self._load_dejavu_long_metrics(target_p, t_start, t0, t_end, default_host=default_host)
         else:
             cache = self._load_wide_prometheus_metrics(target_p, t_start, t0, t_end)
@@ -560,6 +562,134 @@ class RealTelemetryReplayEnvironment:
             local_z = max(abs(i_mean - p_mean) / denom, 0.75 * abs(i_p95 - p_mean) / denom)
             z = float(min(250.0, local_z))
             summary_rows.append((svc, metric_key, p_mean, p_std, i_mean, i_p95, i_max, z))
+
+        summary_rows.sort(key=lambda r: r[7], reverse=True)
+        return _LoadedMetricsCache(services=sorted(services_set), summary_rows=summary_rows)
+
+    @classmethod
+    def _get_or_parse_openrca_day_table(cls, path: Path) -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
+        """Parse an OpenRCA day `metric/` folder once via C++ DuckDB into sorted `(ts_arr, val_arr)` series."""
+        import duckdb
+
+        day_key = f"openrca::{path.parent}"
+        with _CACHE_LOCK:
+            existing = _DEJAVU_RAW_TABLE_CACHE.get(day_key)
+            if existing is not None:
+                return existing  # type: ignore[return-value]
+            file_lock = _DEJAVU_FILE_LOCKS.setdefault(day_key, threading.Lock())
+
+        with file_lock:
+            with _CACHE_LOCK:
+                existing = _DEJAVU_RAW_TABLE_CACHE.get(day_key)
+                if existing is not None:
+                    return existing  # type: ignore[return-value]
+
+            sibling_csvs = sorted(path.parent.glob("metric_*.csv")) or ([path] if path.exists() else [])
+            filtered = [
+                str(f)
+                for f in sibling_csvs
+                if not ("metric_app.csv" in f.name or "metric_mesh.csv" in f.name) or len(sibling_csvs) == 1
+            ] or [str(f) for f in sibling_csvs]
+
+            raw_ts: dict[tuple[str, str], list[int]] = {}
+            raw_vals: dict[tuple[str, str], list[float]] = {}
+            tmp_con = duckdb.connect(":memory:")
+            try:
+                for csv_str in filtered:
+                    p_csv = Path(csv_str)
+                    if not p_csv.exists():
+                        continue
+                    stride = max(1, int((p_csv.stat().st_size / (1024 * 1024)) // 40))
+                    try:
+                        cols_desc = [
+                            r[0]
+                            for r in tmp_con.execute(
+                                "DESCRIBE SELECT * FROM read_csv_auto(?, ignore_errors=true)", [csv_str]
+                            ).fetchall()
+                        ]
+                    except duckdb.Error:
+                        continue
+                    if "timestamp" not in cols_desc or "value" not in cols_desc:
+                        continue
+                    svc_expr = "cmdb_id" if "cmdb_id" in cols_desc else ("service" if "service" in cols_desc else "'unknown'")
+                    kpi_expr = "kpi_name" if "kpi_name" in cols_desc else ("name" if "name" in cols_desc else "'kpi'")
+                    try:
+                        rows = tmp_con.execute(
+                            f"""
+                            WITH raw AS (
+                                SELECT row_number() OVER () AS rn, * FROM read_csv_auto(?, ignore_errors=true)
+                            )
+                            SELECT
+                                CASE
+                                    WHEN TRY_CAST(timestamp AS DOUBLE) > 1e12 THEN CAST(TRY_CAST(timestamp AS DOUBLE) / 1000 AS BIGINT)
+                                    ELSE TRY_CAST(TRY_CAST(timestamp AS DOUBLE) AS BIGINT)
+                                END AS ts,
+                                CAST({svc_expr} AS VARCHAR) AS svc,
+                                CAST({kpi_expr} AS VARCHAR) AS kpi,
+                                TRY_CAST(value AS DOUBLE) AS val
+                            FROM raw
+                            WHERE rn % {stride} = 0
+                              AND TRY_CAST(timestamp AS DOUBLE) IS NOT NULL
+                              AND TRY_CAST(value AS DOUBLE) IS NOT NULL
+                              AND NOT isnan(TRY_CAST(value AS DOUBLE))
+                            """,
+                            [csv_str],
+                        ).fetchall()
+                    except duckdb.Error:
+                        continue
+                    for ts, svc, kpi, val in rows:
+                        if ts is not None and val is not None:
+                            k = (str(svc).strip(), str(kpi).strip())
+                            raw_ts.setdefault(k, []).append(int(ts))
+                            raw_vals.setdefault(k, []).append(float(val))
+            finally:
+                tmp_con.close()
+
+            indexed: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+            for k, ts_list in raw_ts.items():
+                ts_arr = np.array(ts_list, dtype=np.int64)
+                v_arr = np.array(raw_vals[k], dtype=np.float64)
+                order = np.argsort(ts_arr)
+                indexed[k] = (ts_arr[order], v_arr[order])
+
+            with _CACHE_LOCK:
+                _DEJAVU_RAW_TABLE_CACHE[day_key] = indexed  # type: ignore[assignment]
+            return indexed
+
+    @classmethod
+    def _load_openrca_metrics(
+        cls,
+        path: Path,
+        t_start: int,
+        t_inject: int,
+        t_end: int,
+    ) -> _LoadedMetricsCache:
+        """Compute scale-invariant baseline vs. incident z-scores for OpenRCA (`EviRCA`-style preprocessing)."""
+        table = cls._get_or_parse_openrca_day_table(path)
+        services_set: set[str] = set()
+        summary_rows: list[tuple[str, str, float, float, float, float, float, float]] = []
+
+        for (svc, kpi), (ts_arr, v_arr) in table.items():
+            services_set.add(svc)
+            i0 = int(np.searchsorted(ts_arr, t_start, side="left"))
+            i_mid = int(np.searchsorted(ts_arr, t_inject, side="left"))
+            i1 = int(np.searchsorted(ts_arr, t_end, side="right"))
+
+            p_arr = v_arr[i0:i_mid]
+            i_arr = v_arr[i_mid:i1]
+            if p_arr.size < 2 or i_arr.size < 2:
+                continue
+
+            p_mean = float(np.median(p_arr))
+            p_std = float(np.std(p_arr))
+            i_mean = float(np.median(i_arr))
+            i_p95 = float(np.percentile(i_arr, 95))
+            i_max = float(np.max(i_arr))
+            scale_floor = 0.01 if abs(p_mean) < 1.0 else max(abs(p_mean) * 0.05, 0.10)
+            denom = max(p_std, scale_floor)
+            local_z = max(abs(i_mean - p_mean) / denom, 0.65 * abs(i_p95 - p_mean) / denom)
+            z = float(min(250.0, local_z))
+            summary_rows.append((svc, f"{svc}::{kpi}", p_mean, p_std, i_mean, i_p95, i_max, z))
 
         summary_rows.sort(key=lambda r: r[7], reverse=True)
         return _LoadedMetricsCache(services=sorted(services_set), summary_rows=summary_rows)

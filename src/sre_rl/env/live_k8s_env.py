@@ -35,6 +35,7 @@ FORBIDDEN_K8S_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 LIVE_K8S_ALIAS_BANKS: dict[str, tuple[str, ...]] = {
+    "k8s_cluster_sweep": ("k8s_cluster_sweep", "kubectl_triage_sweep", "cluster_health_diff"),
     "k8s_get": ("k8s_get", "kubectl_get", "cluster_list_resources"),
     "k8s_describe": ("k8s_describe", "kubectl_describe", "cluster_inspect_object"),
     "k8s_logs": ("k8s_logs", "kubectl_logs", "pod_tail_logs"),
@@ -42,6 +43,8 @@ LIVE_K8S_ALIAS_BANKS: dict[str, tuple[str, ...]] = {
     "k8s_patch": ("k8s_patch", "kubectl_patch", "patch_k8s_resource"),
     "k8s_scale": ("k8s_scale", "kubectl_scale", "scale_deployment"),
     "k8s_rollout_undo": ("k8s_rollout_undo", "kubectl_rollout_undo", "rollback_deployment"),
+    "k8s_rollout_restart": ("k8s_rollout_restart", "kubectl_rollout_restart", "restart_deployment"),
+    "k8s_delete": ("k8s_delete", "kubectl_delete_object", "remove_blocking_policy"),
     "submit_incident_report": ("submit_incident_report", "close_k8s_incident", "resolve_outage"),
 }
 
@@ -100,6 +103,55 @@ DEFAULT_LIVE_K8S_FAULTS: tuple[LiveK8sFaultSpec, ...] = (
         symptom_summary="search-gateway P99 latency spiked >5s with severe CPU throttling in app-prod.",
         expected_replicas=2,
     ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-auth-selector-drift",
+        deployment_name="auth-api",
+        fault_kind="bad_service_selector",
+        symptom_summary="auth-api Service returning 503 with 0 active Endpoints despite healthy running pods.",
+        expected_replicas=2,
+    ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-pricing-targetport-mismatch",
+        deployment_name="pricing-engine",
+        fault_kind="bad_target_port",
+        symptom_summary="pricing-engine Service connections immediately refused despite Ready pods.",
+        expected_replicas=2,
+    ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-cart-netpol-deny",
+        deployment_name="cart-backend",
+        fault_kind="network_policy_block",
+        symptom_summary="cart-backend unreachable from callers in app-prod due to packet drops.",
+        expected_replicas=2,
+    ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-billing-quota-cap",
+        deployment_name="billing-svc",
+        fault_kind="resource_quota_cap",
+        symptom_summary="billing-svc stuck at 0/2 pods after rollout with ReplicaSet creation failures.",
+        expected_replicas=2,
+    ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-feed-rollout-deadlock",
+        deployment_name="feed-ranker",
+        fault_kind="rolling_update_deadlock",
+        symptom_summary="feed-ranker rollout stalled at 0 updated pods with ProgressDeadlineExceeded.",
+        expected_replicas=2,
+    ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-shipping-env-shadow",
+        deployment_name="shipping-worker",
+        fault_kind="env_var_shadowing",
+        symptom_summary="shipping-worker crashing despite valid ConfigMap STARTUP_CHECK=ok.",
+        expected_replicas=2,
+    ),
+    LiveK8sFaultSpec(
+        scenario_id="live-k8s-ledger-liveness-loop",
+        deployment_name="ledger-api",
+        fault_kind="bad_liveness",
+        symptom_summary="ledger-api pods killed every 10 seconds by kubelet liveness probe.",
+        expected_replicas=2,
+    ),
 )
 
 
@@ -119,6 +171,7 @@ class LiveK8sHarnessConfig:
         return self.alias_to_canonical.get(norm, norm)
 
     def build_system_prompt(self) -> str:
+        t_sweep = self.tool_name("k8s_cluster_sweep")
         t_get = self.tool_name("k8s_get")
         t_desc = self.tool_name("k8s_describe")
         t_logs = self.tool_name("k8s_logs")
@@ -126,19 +179,24 @@ class LiveK8sHarnessConfig:
         t_patch = self.tool_name("k8s_patch")
         t_scale = self.tool_name("k8s_scale")
         t_undo = self.tool_name("k8s_rollout_undo")
+        t_restart = self.tool_name("k8s_rollout_restart")
+        t_del = self.tool_name("k8s_delete")
         t_sub = self.tool_name("submit_incident_report")
         return (
             "You are OmniSRE, an autonomous SRE operating inside a LIVE Kubernetes cluster (`namespace: app-prod`).\n"
-            "Investigate real pods, events, logs, and deployments, safely remediate the root cause, verify pods become "
-            "Ready, and submit the final incident report.\n\n"
+            "Investigate real pods, services, endpoints, quotas, networkpolicies, events, logs, and deployments, "
+            "safely remediate the root cause, verify pods & endpoints recover, and submit the final incident report.\n\n"
             "Available Tools (you may emit 1-4 parallel read `<tool_call>` blocks per turn):\n"
-            f"- `{t_get}`: `{{\"resource\": \"pods|deployments|services|configmaps\", \"name\": \"\"}}` — inspect live K8s objects.\n"
-            f"- `{t_desc}`: `{{\"resource\": \"pod|deployment|service|configmap\", \"name\": \"<name>\"}}` — detailed K8s spec & status.\n"
+            f"- `{t_sweep}`: `{{}}` — deterministic 1-call pre-triage diff (non-Ready pods, 0-endpoint Services, Warning events, Quotas, NetworkPolicies).\n"
+            f"- `{t_get}`: `{{\"resource\": \"pods|deployments|services|endpoints|configmaps|networkpolicies|resourcequotas\", \"name\": \"\"}}` — inspect live K8s objects.\n"
+            f"- `{t_desc}`: `{{\"resource\": \"pod|deployment|service|configmap|networkpolicy|resourcequota\", \"name\": \"<name>\"}}` — detailed K8s spec & status.\n"
             f"- `{t_logs}`: `{{\"pod\": \"<pod_or_deploy>\", \"tail\": 40}}` — fetch container logs.\n"
             f"- `{t_ev}`: `{{\"limit\": 20}}` — list recent Kubernetes warning/normal events in `app-prod`.\n"
-            f"- `{t_patch}`: `{{\"resource\": \"deployment|configmap\", \"name\": \"<name>\", \"patch_json\": {{...}}}}` — strategic-merge patch a broken resource.\n"
+            f"- `{t_patch}`: `{{\"resource\": \"deployment|service|configmap|resourcequota|networkpolicy\", \"name\": \"<name>\", \"patch_json\": {{...}}}}` — strategic/merge patch a broken resource.\n"
             f"- `{t_scale}`: `{{\"deployment\": \"<name>\", \"replicas\": 2}}` — scale deployment replicas.\n"
             f"- `{t_undo}`: `{{\"deployment\": \"<name>\"}}` — roll back a broken deployment revision.\n"
+            f"- `{t_restart}`: `{{\"deployment\": \"<name>\"}}` — rolling restart deployment to reload ConfigMap/Secret credentials.\n"
+            f"- `{t_del}`: `{{\"resource\": \"networkpolicy|resourcequota|pod\", \"name\": \"<name>\"}}` — remove a blocking NetworkPolicy/ResourceQuota or stuck Pod in `app-prod`.\n"
             f"- `{t_sub}`: `{{\"root_service\": \"<deployment>\", \"fault_type\": \"<str>\", \"remediation_applied\": \"<str>\", \"verified_healthy\": true}}`\n\n"
             f"SAFETY RULES: Run >=2 read tools before any write tool. Stay strictly in `app-prod`. "
             f"Budget: max_turns={self.max_turns}.\n"
@@ -253,6 +311,15 @@ def _build_healthy_manifest(spec: LiveK8sFaultSpec) -> str:
                     "data": {"APP_MODE": "production", "STARTUP_CHECK": "ok"},
                 },
                 {
+                    "apiVersion": "v1",
+                    "kind": "Service",
+                    "metadata": {"name": f"{spec.deployment_name}-svc", "namespace": "app-prod"},
+                    "spec": {
+                        "selector": {"app": spec.deployment_name},
+                        "ports": [{"name": "http", "port": 80, "targetPort": 8080}],
+                    },
+                },
+                {
                     "apiVersion": "apps/v1",
                     "kind": "Deployment",
                     "metadata": {"name": spec.deployment_name, "namespace": "app-prod"},
@@ -331,7 +398,10 @@ class LiveK8sKindEnvironment:
         adm = self.lease.admin_kubeconfig
         # Clean previous workload and apply known-good rev 1 (so rollout undo works cleanly)
         _run_kubectl(adm, ["delete", "deployment", spec.deployment_name, "--ignore-not-found=true"])
+        _run_kubectl(adm, ["delete", "service", f"{spec.deployment_name}-svc", "--ignore-not-found=true"])
         _run_kubectl(adm, ["delete", "configmap", f"{spec.deployment_name}-cfg", "--ignore-not-found=true"])
+        _run_kubectl(adm, ["delete", "networkpolicy", f"{spec.deployment_name}-deny", "--ignore-not-found=true"])
+        _run_kubectl(adm, ["delete", "resourcequota", "app-prod-quota", "--ignore-not-found=true"])
         _run_kubectl(adm, ["apply", "-f", "-"], stdin_text=_build_healthy_manifest(spec))
         time.sleep(2.0)
 
@@ -352,6 +422,41 @@ class LiveK8sKindEnvironment:
             _run_kubectl(adm, ["rollout", "restart", "deployment", spec.deployment_name])
         elif spec.fault_kind == "cpu_starve":
             patch = {"spec": {"template": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"cpu": "1m"}, "requests": {"cpu": "1m"}}}]}}}}
+            _run_kubectl(adm, ["patch", "deployment", spec.deployment_name, "--type=strategic", "-p", json.dumps(patch)])
+        elif spec.fault_kind == "bad_service_selector":
+            _run_kubectl(adm, ["patch", "service", f"{spec.deployment_name}-svc", "--type=merge", "-p", json.dumps({"spec": {"selector": {"app": f"{spec.deployment_name}-wrong"}}})])
+        elif spec.fault_kind == "bad_target_port":
+            _run_kubectl(adm, ["patch", "service", f"{spec.deployment_name}-svc", "--type=merge", "-p", json.dumps({"spec": {"ports": [{"name": "http", "port": 80, "targetPort": 19999}]}})])
+        elif spec.fault_kind == "network_policy_block":
+            np_doc = {
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {"name": f"{spec.deployment_name}-deny", "namespace": "app-prod"},
+                "spec": {"podSelector": {"matchLabels": {"app": spec.deployment_name}}, "policyTypes": ["Ingress"], "ingress": []},
+            }
+            _run_kubectl(adm, ["apply", "-f", "-"], stdin_text=json.dumps(np_doc))
+        elif spec.fault_kind == "resource_quota_cap":
+            rq_doc = {
+                "apiVersion": "v1",
+                "kind": "ResourceQuota",
+                "metadata": {"name": "app-prod-quota", "namespace": "app-prod"},
+                "spec": {"hard": {"pods": "0"}},
+            }
+            _run_kubectl(adm, ["apply", "-f", "-"], stdin_text=json.dumps(rq_doc))
+            _run_kubectl(adm, ["rollout", "restart", "deployment", spec.deployment_name])
+        elif spec.fault_kind == "rolling_update_deadlock":
+            patch = {
+                "spec": {
+                    "strategy": {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 0}},
+                    "template": {"metadata": {"annotations": {"rollout-bump": "v2"}}},
+                }
+            }
+            _run_kubectl(adm, ["patch", "deployment", spec.deployment_name, "--type=merge", "-p", json.dumps(patch)])
+        elif spec.fault_kind == "env_var_shadowing":
+            patch = {"spec": {"template": {"spec": {"containers": [{"name": "app", "env": [{"name": "STARTUP_CHECK", "value": "shadowed-broken"}]}]}}}}
+            _run_kubectl(adm, ["patch", "deployment", spec.deployment_name, "--type=strategic", "-p", json.dumps(patch)])
+        elif spec.fault_kind == "bad_liveness":
+            patch = {"spec": {"template": {"spec": {"containers": [{"name": "app", "livenessProbe": {"exec": {"command": ["sh", "-c", "exit 1"]}, "initialDelaySeconds": 1, "periodSeconds": 2, "failureThreshold": 1}}]}}}}
             _run_kubectl(adm, ["patch", "deployment", spec.deployment_name, "--type=strategic", "-p", json.dumps(patch)])
 
         time.sleep(2.5)
@@ -421,6 +526,23 @@ class LiveK8sKindEnvironment:
         args = call.arguments
         agt = self.lease.agent_kubeconfig
         serialized = json.dumps(args)
+
+        if name == "k8s_cluster_sweep":
+            err = self._check_safety(serialized, is_write=False)
+            if err:
+                return err, False, -0.35, True
+            _, pods = _run_kubectl(agt, ["get", "pods", "-o", "wide"])
+            _, eps = _run_kubectl(agt, ["get", "endpoints"])
+            _, npols = _run_kubectl(agt, ["get", "networkpolicies"])
+            _, quotas = _run_kubectl(agt, ["get", "resourcequotas"])
+            _, evs = _run_kubectl(agt, ["get", "events", "--field-selector=type=Warning"])
+            self._read_queries += 1
+            sweep = (
+                f"[PODS]\n{pods}\n[ENDPOINTS]\n{eps}\n"
+                f"[NETWORK_POLICIES]\n{npols}\n[RESOURCE_QUOTAS]\n{quotas}\n"
+                f"[WARNING_EVENTS]\n" + "\n".join(evs.splitlines()[-12:])
+            )
+            return sweep, False, 0.025, False
 
         if name == "k8s_get":
             err = self._check_safety(serialized, is_write=False)
@@ -507,6 +629,29 @@ class LiveK8sKindEnvironment:
             time.sleep(2.5)
             return out, False, (0.04 if rc == 0 else -0.03), False
 
+        if name == "k8s_rollout_restart":
+            err = self._check_safety(serialized, is_write=True)
+            if err:
+                return err, False, -0.40, True
+            dep = str(args.get("deployment", "")).strip()
+            rc, out = _run_kubectl(agt, ["rollout", "restart", "deployment", dep])
+            self._write_actions += 1
+            time.sleep(2.5)
+            return out, False, (0.04 if rc == 0 else -0.03), False
+
+        if name == "k8s_delete":
+            err = self._check_safety(serialized, is_write=True)
+            if err:
+                return err, False, -0.40, True
+            res = str(args.get("resource", "")).strip().lower()
+            obj = str(args.get("name", "")).strip()
+            if res not in ("networkpolicy", "networkpolicies", "resourcequota", "resourcequotas", "pod", "pods") or not obj:
+                return "ERROR: `k8s_delete` only permits `networkpolicy`, `resourcequota`, or `pod` with explicit `name`.", False, -0.04, False
+            rc, out = _run_kubectl(agt, ["delete", res, obj])
+            self._write_actions += 1
+            time.sleep(2.0)
+            return out, False, (0.04 if rc == 0 else -0.03), False
+
         if name == "submit_incident_report":
             self._submission = dict(args)
             return "INCIDENT_REPORT_RECORDED. Live verification running.", True, 0.0, False
@@ -533,7 +678,20 @@ class LiveK8sKindEnvironment:
                     containers = dep.get("spec", {}).get("template", {}).get("spec", {}).get("containers", [])
                     cpu_lim = str(containers[0].get("resources", {}).get("limits", {}).get("cpu", "200m")) if containers else "200m"
                     cpu_ok = (self._spec.fault_kind != "cpu_starve") or (cpu_lim != "1m")
-                    if ready_reps >= desired_reps and unavail == 0 and cpu_ok:
+                    svc_ok = True
+                    if self._spec.fault_kind in ("bad_service_selector", "bad_target_port"):
+                        rc_ep, ep_raw = _run_kubectl(adm, ["get", "endpoints", f"{self._spec.deployment_name}-svc", "-o", "json"])
+                        rc_sv, sv_raw = _run_kubectl(adm, ["get", "service", f"{self._spec.deployment_name}-svc", "-o", "json"])
+                        ep_cnt = len(json.loads(ep_raw).get("subsets", [{}])[0].get("addresses", [])) if rc_ep == 0 and json.loads(ep_raw).get("subsets") else 0
+                        tport = json.loads(sv_raw).get("spec", {}).get("ports", [{}])[0].get("targetPort") if rc_sv == 0 else 0
+                        svc_ok = (ep_cnt >= desired_reps) and (int(tport or 0) == 8080)
+                    np_ok = True
+                    if self._spec.fault_kind == "network_policy_block":
+                        rc_np, np_raw = _run_kubectl(adm, ["get", "networkpolicy", f"{self._spec.deployment_name}-deny", "-o", "json"])
+                        if rc_np == 0:
+                            ing = json.loads(np_raw).get("spec", {}).get("ingress")
+                            np_ok = bool(ing)
+                    if ready_reps >= desired_reps and unavail == 0 and cpu_ok and svc_ok and np_ok:
                         healthy_cluster = True
                         break
                 except json.JSONDecodeError:
