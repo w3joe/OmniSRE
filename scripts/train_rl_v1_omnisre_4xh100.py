@@ -25,12 +25,14 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime
+import http.client
 import json
 import os
 import random
 import shutil
 import subprocess
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -118,19 +120,33 @@ def _sglang_generate_tito(
     max_new_tokens: int,
     im_end_id: int,
 ) -> tuple[list[int], str]:
-    resp = _post_json(
-        f"{sglang_base_url.rstrip('/')}/generate",
-        {
-            "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": temperature,
-                "top_p": 0.95 if temperature > 0.0 else 1.0,
-                "max_new_tokens": max_new_tokens,
-                "stop_token_ids": list({int(tokenizer.eos_token_id), im_end_id}),
+    # Bound input_ids safely below 15,360 tokens so SGLang never rejects with HTTP 400
+    bounded_ids = input_ids[: max(512, 15360 - max_new_tokens)]
+    try:
+        resp = _post_json(
+            f"{sglang_base_url.rstrip('/')}/generate",
+            {
+                "input_ids": bounded_ids,
+                "sampling_params": {
+                    "temperature": temperature,
+                    "top_p": 0.95 if temperature > 0.0 else 1.0,
+                    "max_new_tokens": max_new_tokens,
+                    "stop_token_ids": list({int(tokenizer.eos_token_id), im_end_id}),
+                },
             },
-        },
-        timeout=90,
-    )
+            timeout=150,
+        )
+    except (
+        urllib.error.HTTPError,
+        urllib.error.URLError,
+        http.client.HTTPException,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
+        print(f"[sglang-warn] /generate skipped on {sglang_base_url}: {exc}", flush=True)
+        return [], ""
     out_ids = [
         int(t) for t in (resp.get("output_ids") or resp.get("meta_info", {}).get("output_ids") or [])
     ]

@@ -55,16 +55,20 @@ if [[ ! -f "${NVME_ROOT}/data_v2_expanded/sft_v2_expanded_calibration.jsonl" ]];
   gcloud storage rsync -r "${NVME_ROOT}/data_v2_expanded" "${GCS_V2}/dataset-expanded" --quiet
 fi
 
-echo "=== [v2.0 2/5] Running Assistant-Masked Calibration SFT Starting from OmniSRE v1.0 ==="
 SFT_MERGED="${NVME_ROOT}/omnisre-v2-sft-merged"
-CUDA_VISIBLE_DEVICES=0,1,2,3 "${NVME_ROOT}/venv-sre-rl/bin/torchrun" --nproc_per_node=4 --master_port=29501 \
-  scripts/train_sft_qwen38_lora.py \
-  --config configs/sft_v2_expanded_4xh100.yaml \
-  --model-path "${BASE_V1}" \
-  --train-jsonl "${NVME_ROOT}/data_v2_expanded/sft_v2_expanded_calibration.jsonl" \
-  --output-dir "${NVME_ROOT}/checkpoints_v2/sft-lora64" \
-  --merge-output-dir "${SFT_MERGED}"
-gcloud storage rsync -r "${SFT_MERGED}" "${GCS_V2}/sft-merged-27b-bf16" --quiet
+if [[ ! -f "${SFT_MERGED}/model.safetensors.index.json" ]]; then
+  echo "=== [v2.0 2/5] Running Assistant-Masked Calibration SFT Starting from OmniSRE v1.0 ==="
+  CUDA_VISIBLE_DEVICES=0,1,2,3 "${NVME_ROOT}/venv-sre-rl/bin/torchrun" --nproc_per_node=4 --master_port=29501 \
+    scripts/train_sft_qwen38_lora.py \
+    --config configs/sft_v2_expanded_4xh100.yaml \
+    --model-path "${BASE_V1}" \
+    --train-jsonl "${NVME_ROOT}/data_v2_expanded/sft_v2_expanded_calibration.jsonl" \
+    --output-dir "${NVME_ROOT}/checkpoints_v2/sft-lora64" \
+    --merge-output-dir "${SFT_MERGED}"
+  gcloud storage rsync -r "${SFT_MERGED}" "${GCS_V2}/sft-merged-27b-bf16" --quiet
+else
+  echo "=== [v2.0 2/5] Reusing Pre-Merged Assistant-Masked SFT Checkpoint (${SFT_MERGED}) ==="
+fi
 
 if [[ "${ENABLE_LIVE_KIND}" == "1" ]] && command -v kind >/dev/null 2>&1 && command -v kubectl >/dev/null 2>&1; then
   echo "=== [v2.0 3/5] Bootstrapping ${NUM_KIND_CLUSTERS} Isolated Live Kind K8s Clusters ==="
@@ -79,8 +83,8 @@ for g in 0 1; do
     --model-path "${SFT_MERGED}" \
     --served-model-name omnisre-27b-v2 \
     --trust-remote-code --tp-size 1 --kv-cache-dtype fp8_e4m3 --mamba-ssm-dtype bfloat16 \
-    --max-mamba-cache-size 115 --mem-fraction-static 0.85 --context-length 8192 \
-    --disable-prefill-cuda-graph --attention-backend flashinfer --chunked-prefill-size 8192 \
+    --max-mamba-cache-size 96 --mem-fraction-static 0.85 --context-length 16384 \
+    --disable-prefill-cuda-graph --attention-backend flashinfer --chunked-prefill-size 16384 \
     --host 127.0.0.1 --port "${PORT}" \
     > "${NVME_ROOT}/sglang_v2_gpu${g}.log" 2>&1 &
   SGLANG_PIDS+=("$!")
