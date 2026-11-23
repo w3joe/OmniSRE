@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 mkdir -p "${LEASE_ROOT}"
+docker pull busybox:1.36 >/dev/null 2>&1 || true
 
 for ((i=0; i<NUM_CLUSTERS; i++)); do
   NAME=$(printf "sre-rl-kind-%02d" "$i")
@@ -38,6 +39,7 @@ EOF
       --kubeconfig "${DIR}/admin-injector.kubeconfig" \
       --wait 90s
   fi
+  kind load docker-image busybox:1.36 --name "${NAME}" >/dev/null 2>&1 || true
 
   # Apply least-privilege agent RBAC & sample target app deployment
   kubectl --kubeconfig "${DIR}/admin-injector.kubeconfig" apply -f "${REPO_ROOT}/infra/k8s/sre_agent_rbac.yaml"
