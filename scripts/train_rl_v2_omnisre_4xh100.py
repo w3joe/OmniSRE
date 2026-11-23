@@ -70,7 +70,7 @@ from sre_rl.v5_sre1_upgrades import sample_group_harness
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_rl_v1_omnisre_4xh100 import (
     _load_tier1_scenarios,
-    evaluate_true_tree_5x,
+    evaluate_tree_ensemble_5x_v1,
     rollout_live_k8s_v1,
     rollout_offline_synthesis_v1,
     rollout_real_telemetry_v1,
@@ -557,7 +557,7 @@ def main() -> None:
         peft_model.save_pretrained(args.output_dir)
         tokenizer.save_pretrained(args.output_dir)
         after_eval = _eval_all_unseen("after_rl_v2_omnisre")
-        tree_5x = evaluate_true_tree_5x(sglang_urls[0], tokenizer, eval_real_slice[:30], args.max_turns, args.rollout_workers)
+        tree_5x = evaluate_tree_ensemble_5x_v1(sglang_urls[0], tokenizer, eval_real_slice[:30], args.max_turns, args.rollout_workers)
         summary = {"before_rl": before_eval, "after_rl": after_eval, "tree_5x": tree_5x, "best_combined_score": round(best_combined, 4)}
         (args.output_dir / "v2_eval_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     dist.barrier()
