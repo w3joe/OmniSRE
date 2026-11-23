@@ -168,10 +168,6 @@ def main() -> None:
         "seed": int(t_cfg["seed"]),
         "report_to": "none",
     }
-    import inspect
-
-    if "assistant_only_loss" in inspect.signature(SFTConfig.__init__).parameters:
-        sft_kwargs["assistant_only_loss"] = assistant_only
     sft_args = SFTConfig(**sft_kwargs)  # type: ignore[arg-type]
 
     # Version-proof assistant-only label masking collator (`labels = -100` outside `<|im_start|>assistant ... <|im_end|>`)

@@ -46,12 +46,14 @@ if [[ -d "${NVME_ROOT}/real_telemetry/openrca/OpenRCA/dataset" ]]; then
     --skip-download
 fi
 
-"${NVME_ROOT}/venv-sre-rl/bin/python3" scripts/build_v2_expanded_dataset.py \
-  --out-dir "${NVME_ROOT}/data_v2_expanded" \
-  --existing-rl-train-jsonl "${NVME_ROOT}/data_v2/rl_real_train.jsonl" \
-  --real-telemetry-train-jsonl "${NVME_ROOT}/real_telemetry/index/real_telemetry_train.jsonl" \
-  --openrca-train-jsonl "${NVME_ROOT}/real_telemetry/index/openrca_train.jsonl"
-gcloud storage rsync -r "${NVME_ROOT}/data_v2_expanded" "${GCS_V2}/dataset-expanded" --quiet
+if [[ ! -f "${NVME_ROOT}/data_v2_expanded/sft_v2_expanded_calibration.jsonl" ]]; then
+  "${NVME_ROOT}/venv-sre-rl/bin/python3" scripts/build_v2_expanded_dataset.py \
+    --out-dir "${NVME_ROOT}/data_v2_expanded" \
+    --existing-rl-train-jsonl "${NVME_ROOT}/data_v2/rl_real_train.jsonl" \
+    --real-telemetry-train-jsonl "${NVME_ROOT}/real_telemetry/index/real_telemetry_train.jsonl" \
+    --openrca-train-jsonl "${NVME_ROOT}/real_telemetry/index/openrca_train.jsonl"
+  gcloud storage rsync -r "${NVME_ROOT}/data_v2_expanded" "${GCS_V2}/dataset-expanded" --quiet
+fi
 
 echo "=== [v2.0 2/5] Running Assistant-Masked Calibration SFT Starting from OmniSRE v1.0 ==="
 SFT_MERGED="${NVME_ROOT}/omnisre-v2-sft-merged"
