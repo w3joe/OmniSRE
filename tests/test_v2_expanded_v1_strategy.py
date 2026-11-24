@@ -110,3 +110,10 @@ def test_live_k8s_expanded_faults_and_delete_guardrails(tmp_path: Path) -> None:
     # Deleting namespace or secret must be rejected as SAFETY_VIOLATION
     out_bad = env.step('<think>bad</think>\n<tool_call>{"name": "k8s_delete", "arguments": {"resource": "secret", "name": "db-creds"}}</tool_call>')
     assert "ERROR" in out_bad.observation or "SAFETY_VIOLATION" in out_bad.observation
+
+    # Verify rollout_live_k8s_v1 AST signature matches exact positional call in train_rl_v2_omnisre_4xh100.py
+    import ast
+
+    v1_ast = ast.parse((Path(__file__).resolve().parents[1] / "scripts" / "train_rl_v1_omnisre_4xh100.py").read_text())
+    fn_defs = {n.name: [a.arg for a in n.args.args] for n in v1_ast.body if isinstance(n, ast.FunctionDef)}
+    assert fn_defs["rollout_live_k8s_v1"][:5] == ["sglang_base_url", "tokenizer", "lease_pool", "fault_idx", "rng"]

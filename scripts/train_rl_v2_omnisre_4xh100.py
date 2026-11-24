@@ -45,7 +45,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from sre_rl.env.live_k8s_env import (
     DEFAULT_LIVE_K8S_FAULTS,
     KindClusterLeasePool,
-    sample_live_k8s_harness,
 )
 from sre_rl.env.real_telemetry_env import (
     RealIncidentRecord,
@@ -432,10 +431,16 @@ def main() -> None:
             for w_i in range(n_write):
                 use_live = kind_pool.size > 0 and (w_i % 2 == 1 or not tier1_train)
                 if use_live:
-                    spec_k = rng.choice(DEFAULT_LIVE_K8S_FAULTS)
-                    har_k = sample_live_k8s_harness(rng, default_max_turns=18, randomize_prob=args.harness_rand_prob)
+                    fault_idx = rng.randrange(len(DEFAULT_LIVE_K8S_FAULTS))
+                    worker_rngs = [random.Random(rng.randint(0, 10**9)) for _ in range(args.group_size)]
                     with concurrent.futures.ThreadPoolExecutor(max_workers=min(kind_pool.size, args.group_size)) as pool:
-                        k_trs = [f.result() for f in [pool.submit(rollout_live_k8s_v1, next(url_cycle), tokenizer, kind_pool, spec_k, har_k, 0.85) for _ in range(args.group_size)]]
+                        k_trs = [
+                            f.result()
+                            for f in [
+                                pool.submit(rollout_live_k8s_v1, next(url_cycle), tokenizer, kind_pool, fault_idx, wr, 18, 384, 0.85)
+                                for wr in worker_rngs
+                            ]
+                        ]
                 elif tier1_train:
                     sc_t = rng.choice(tier1_train)
                     har_t = sample_group_harness(rng, default_max_turns=14, randomize_prob=args.harness_rand_prob)
