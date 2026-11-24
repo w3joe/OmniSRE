@@ -233,7 +233,7 @@ def main() -> None:
     parser.add_argument("--eval-heldout-count", type=int, default=60)
     parser.add_argument("--max-turns", type=int, default=24)
     parser.add_argument("--harness-rand-prob", type=float, default=0.60)
-    parser.add_argument("--max-train-seq-len", type=int, default=6144)
+    parser.add_argument("--max-train-seq-len", type=int, default=4864)
     parser.add_argument("--lr", type=float, default=2.5e-6)
     parser.add_argument("--min-lr", type=float, default=3.0e-7)
     parser.add_argument("--entropy-floor", type=float, default=0.20)
@@ -519,6 +519,8 @@ def main() -> None:
                 loss_accum += float(total_loss.item()) / denom
                 ent_accum += float(tok_ent.item()) / denom
             del input_ids, adv_t, mask_t, new_lp, active_pos, total_loss
+            if (s_idx + 1) % 8 == 0:
+                torch.cuda.empty_cache()
 
         grad_norm = float(torch.nn.utils.clip_grad_norm_(trainable_params, 1.0))
         optimizer.step()
